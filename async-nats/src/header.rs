@@ -18,7 +18,7 @@
 // is coming from the derive, it didn't work to set it on the struct.
 #![allow(clippy::mutable_key_type)]
 
-//! NATS [Message][crate::Message] headers, modeled loosely after the [http::header] crate.
+//! NATS [Message][crate::Message] headers, modeled loosely after the `http::header` crate.
 
 use std::{collections::HashMap, fmt, slice::Iter, str::FromStr};
 
@@ -26,7 +26,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// A struct for handling NATS headers.
-/// Has a similar API to [http::header], but properly serializes and deserializes
+/// Has a similar API to `http::header`, but properly serializes and deserializes
 /// according to NATS requirements.
 ///
 /// # Examples
@@ -167,6 +167,23 @@ impl HeaderMap {
         self.inner
             .get(&key.into_header_name())
             .and_then(|x| x.first())
+    }
+
+    /// Gets a last value for a given key. If key is not found, [Option::None] is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use async_nats::HeaderMap;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append("Key", "Value");
+    /// let values = headers.get_last("Key").unwrap();
+    /// ```
+    pub fn get_last<K: IntoHeaderName>(&self, key: K) -> Option<&HeaderValue> {
+        self.inner
+            .get(&key.into_header_name())
+            .and_then(|x| x.last())
     }
 
     /// Gets an iterator to the values for a given key.
@@ -397,7 +414,7 @@ macro_rules! standard_headers {
         )+
     ) => {
         #[allow(clippy::enum_variant_names)]
-        #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
         enum StandardHeader {
             $(
                 $variant,
@@ -481,7 +498,7 @@ standard_headers! {
     (NatsExpectedStream, NATS_EXPECTED_STREAM, b"Nats-Expected-Stream");
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct CustomHeader {
     bytes: Bytes,
 }
@@ -518,7 +535,7 @@ impl<'a> From<&'a str> for CustomHeader {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum HeaderRepr {
     Standard(StandardHeader),
     Custom(CustomHeader),
@@ -533,7 +550,7 @@ enum HeaderRepr {
 ///
 /// `HeaderName` represents standard header names using an `enum`, as such they
 /// will not require an allocation for storage.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct HeaderName {
     inner: HeaderRepr,
 }
@@ -600,6 +617,26 @@ impl AsRef<str> for HeaderName {
     }
 }
 
+impl Serialize for HeaderName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for HeaderName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseHeaderNameError;
 
@@ -659,6 +696,9 @@ mod tests {
         assert_eq!(key, "value".to_string());
 
         assert_eq!(headers.get("Key").unwrap().as_str(), "value");
+
+        let key: String = headers.get_last("Key").unwrap().as_str().into();
+        assert_eq!(key, "other".to_string());
     }
 
     #[test]
@@ -759,5 +799,19 @@ mod tests {
         let b = HeaderName::from_static("NATS-Stream");
 
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn header_name_serde() {
+        let raw = "Nats-Stream";
+        let raw_json = "\"Nats-Stream\"";
+        let header = HeaderName::from_static(raw);
+
+        // ser/de of HeaderName should be the same as raw string
+        assert_eq!(serde_json::to_string(&header).unwrap(), raw_json);
+        assert_eq!(
+            serde_json::from_str::<HeaderName>(raw_json).unwrap(),
+            header
+        );
     }
 }

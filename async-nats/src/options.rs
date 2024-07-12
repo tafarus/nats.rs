@@ -42,12 +42,9 @@ use tokio_rustls::rustls;
 /// # }
 /// ```
 pub struct ConnectOptions {
-    // pub(crate) auth: AuthStyle,
     pub(crate) name: Option<String>,
     pub(crate) no_echo: bool,
-    pub(crate) retry_on_failed_connect: bool,
     pub(crate) max_reconnects: Option<usize>,
-    pub(crate) reconnect_buffer_size: usize,
     pub(crate) connection_timeout: Duration,
     pub(crate) auth: Auth,
     pub(crate) tls_required: bool,
@@ -59,7 +56,7 @@ pub struct ConnectOptions {
     pub(crate) ping_interval: Duration,
     pub(crate) subscription_capacity: usize,
     pub(crate) sender_capacity: usize,
-    pub(crate) event_callback: CallbackArg1<Event, ()>,
+    pub(crate) event_callback: Option<CallbackArg1<Event, ()>>,
     pub(crate) inbox_prefix: String,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) retry_on_initial_connect: bool,
@@ -75,8 +72,6 @@ impl fmt::Debug for ConnectOptions {
         f.debug_map()
             .entry(&"name", &self.name)
             .entry(&"no_echo", &self.no_echo)
-            .entry(&"retry_on_failed_connect", &self.retry_on_failed_connect)
-            .entry(&"reconnect_buffer_size", &self.reconnect_buffer_size)
             .entry(&"max_reconnects", &self.max_reconnects)
             .entry(&"connection_timeout", &self.connection_timeout)
             .entry(&"tls_required", &self.tls_required)
@@ -88,7 +83,7 @@ impl fmt::Debug for ConnectOptions {
             .entry(&"ping_interval", &self.ping_interval)
             .entry(&"sender_capacity", &self.sender_capacity)
             .entry(&"inbox_prefix", &self.inbox_prefix)
-            .entry(&"retry_on_initial_connect", &self.retry_on_failed_connect)
+            .entry(&"retry_on_initial_connect", &self.retry_on_initial_connect)
             .entry(&"read_buffer_capacity", &self.read_buffer_capacity)
             .finish()
     }
@@ -99,9 +94,7 @@ impl Default for ConnectOptions {
         ConnectOptions {
             name: None,
             no_echo: false,
-            retry_on_failed_connect: false,
-            reconnect_buffer_size: 8 * 1024 * 1024,
-            max_reconnects: Some(60),
+            max_reconnects: None,
             connection_timeout: Duration::from_secs(5),
             tls_required: false,
             tls_first: false,
@@ -112,11 +105,7 @@ impl Default for ConnectOptions {
             ping_interval: Duration::from_secs(60),
             sender_capacity: 2048,
             subscription_capacity: 1024 * 64,
-            event_callback: CallbackArg1::<Event, ()>(Box::new(move |event| {
-                Box::pin(async move {
-                    tracing::info!("event: {}", event);
-                })
-            })),
+            event_callback: None,
             inbox_prefix: "_INBOX".to_string(),
             request_timeout: Some(Duration::from_secs(10)),
             retry_on_initial_connect: false,
@@ -617,7 +606,7 @@ impl ConnectOptions {
 
     /// Sets the capacity for `Subscribers`. Exceeding it will trigger `slow consumer` error
     /// callback and drop messages.
-    /// Default is set to 1024 messages buffer.
+    /// Default is set to 65536 messages buffer.
     ///
     /// # Examples
     /// ```no_run
@@ -737,7 +726,9 @@ impl ConnectOptions {
         F: Fn(Event) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + 'static + Send + Sync,
     {
-        self.event_callback = CallbackArg1::<Event, ()>(Box::new(move |event| Box::pin(cb(event))));
+        self.event_callback = Some(CallbackArg1::<Event, ()>(Box::new(move |event| {
+            Box::pin(cb(event))
+        })));
         self
     }
 
@@ -821,11 +812,44 @@ impl ConnectOptions {
         self
     }
 
+    /// By default, [`ConnectOptions::connect`] will return an error if
+    /// the connection to the server cannot be established.
+    ///
+    /// Setting `retry_on_initial_connect` makes the client
+    /// establish the connection in the background.
     pub fn retry_on_initial_connect(mut self) -> ConnectOptions {
         self.retry_on_initial_connect = true;
         self
     }
 
+    /// Specifies the number of consecutive reconnect attempts the client will
+    /// make before giving up. This is useful for preventing zombie services
+    /// from endlessly reaching the servers, but it can also be a footgun and
+    /// surprise for users who do not expect that the client can give up
+    /// entirely.
+    ///
+    /// Pass `None` or `0` for no limit.
+    ///
+    /// # Examples
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// async_nats::ConnectOptions::new()
+    ///     .max_reconnects(None)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_reconnects<T: Into<Option<usize>>>(mut self, max_reconnects: T) -> ConnectOptions {
+        let val: Option<usize> = max_reconnects.into();
+        self.max_reconnects = if val == Some(0) { None } else { val };
+        self
+    }
+
+    /// By default, a server may advertise other servers in the cluster known to it.
+    /// By setting this option, the client will ignore the advertised servers.
+    /// This may be useful if the client may not be able to reach them.
     pub fn ignore_discovered_servers(mut self) -> ConnectOptions {
         self.ignore_discovered_servers = true;
         self
@@ -847,16 +871,9 @@ impl ConnectOptions {
     /// # async fn main() -> Result<(), async_nats::Error> {
     /// let mut root_store = async_nats::rustls::RootCertStore::empty();
     ///
-    /// root_store.add_parsable_certificates(
-    ///     rustls_native_certs::load_native_certs()?
-    ///         .into_iter()
-    ///         .map(|cert| cert.0)
-    ///         .collect::<Vec<Vec<u8>>>()
-    ///         .as_ref(),
-    /// );
+    /// root_store.add_parsable_certificates(rustls_native_certs::load_native_certs()?);
     ///
     /// let tls_client = async_nats::rustls::ClientConfig::builder()
-    ///     .with_safe_defaults()
     ///     .with_root_certificates(root_store)
     ///     .with_no_client_auth();
     ///

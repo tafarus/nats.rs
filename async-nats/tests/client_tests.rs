@@ -25,6 +25,54 @@ mod client {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn force_reconnect() {
+        let (dctx, mut dcrx) = tokio::sync::mpsc::channel(1);
+        let (rctx, mut rcrx) = tokio::sync::mpsc::channel(1);
+
+        let server = nats_server::run_basic_server();
+
+        let client = async_nats::ConnectOptions::new()
+            .event_callback(move |event| {
+                let dctx = dctx.clone();
+                let rctx = rctx.clone();
+                async move {
+                    match event {
+                        Event::Disconnected => dctx.send(()).await.unwrap(),
+                        Event::Connected => rctx.send(()).await.unwrap(),
+                        _ => (),
+                    }
+                }
+            })
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let mut sub = client.subscribe("foo").await.unwrap();
+
+        // make sure message sent just before reconnect is flushed.
+        client.publish("test", "data".into()).await.unwrap();
+        client.force_reconnect().await.unwrap();
+
+        // initial connect event.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            rcrx.recv().await.unwrap();
+            dcrx.recv().await.unwrap();
+            rcrx.recv().await.unwrap();
+        })
+        .await
+        .unwrap();
+        // make sure we actually disconnected and reconnected.
+
+        // make sure our subscription is still active.
+        client.publish("foo", "data".into()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn basic_pub_sub() {
         let server = nats_server::run_basic_server();
         let client = async_nats::connect(server.client_url()).await.unwrap();
@@ -836,5 +884,51 @@ mod client {
         .connect(server.client_url())
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_reconnects() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _client = ConnectOptions::new()
+            .max_reconnects(5)
+            .retry_on_initial_connect()
+            .event_callback(move |event| {
+                let tx = tx.clone();
+                async move {
+                    println!("event: {event}");
+                    tx.send(event).unwrap();
+                }
+            })
+            .connect("localhost:7777")
+            .await
+            .unwrap();
+
+        for _ in 0..5 {
+            match rx.recv().await.unwrap() {
+                Event::ClientError(async_nats::ClientError::Other(_)) => (),
+                other => panic!("unexpected event: {:?}", other),
+            };
+        }
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Event::ClientError(async_nats::ClientError::MaxReconnects)
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_payload_size() {
+        let server = nats_server::run_server("tests/configs/max_payload.conf");
+
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        // this exceeds the small payload limit in server config.
+        let payload = vec![0u8; 1024 * 1024];
+
+        client.publish("big", payload.into()).await.unwrap_err();
+        client.publish("small", "data".into()).await.unwrap();
+        client
+            .publish("just_ok", vec![0u8; 1024 * 128].into())
+            .await
+            .unwrap();
     }
 }

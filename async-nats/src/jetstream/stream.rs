@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-//! Manage operations on a [Stream], create/delete/update [Consumer][crate::jetstream::consumer::Consumer].
+//! Manage operations on a [Stream], create/delete/update [Consumer].
 
 #[cfg(feature = "server_2_10")]
 use std::collections::HashMap;
@@ -679,8 +679,9 @@ impl Stream {
         self.purge().filter(subject).await
     }
 
-    /// Create a new `Durable` or `Ephemeral` Consumer (if `durable_name` was not provided) and
-    /// returns the info from the server about created [Consumer][Consumer]
+    /// Create or update `Durable` or `Ephemeral` Consumer (if `durable_name` was not provided) and
+    /// returns the info from the server about created [Consumer]
+    /// If you want a strict update or create, use [Stream::create_consumer_strict] or [Stream::update_consumer].
     ///
     /// # Examples
     ///
@@ -705,57 +706,76 @@ impl Stream {
         &self,
         config: C,
     ) -> Result<Consumer<C>, ConsumerError> {
-        let config = config.into_consumer_config();
+        self.context
+            .create_consumer_on_stream(config, self.info.config.name.clone())
+            .await
+    }
 
-        let subject = {
-            if self.context.client.is_server_compatible(2, 9, 0) {
-                let filter = if config.filter_subject.is_empty() {
-                    "".to_string()
-                } else {
-                    format!(".{}", config.filter_subject)
-                };
-                config
-                    .name
-                    .as_ref()
-                    .or(config.durable_name.as_ref())
-                    .map(|name| {
-                        format!(
-                            "CONSUMER.CREATE.{}.{}{}",
-                            self.info.config.name, name, filter
-                        )
-                    })
-                    .unwrap_or_else(|| format!("CONSUMER.CREATE.{}", self.info.config.name))
-            } else if config.name.is_some() {
-                return Err(ConsumerError::with_source(
-                    ConsumerErrorKind::Other,
-                    "can't use consumer name with server < 2.9.0",
-                ));
-            } else if let Some(ref durable_name) = config.durable_name {
-                format!(
-                    "CONSUMER.DURABLE.CREATE.{}.{}",
-                    self.info.config.name, durable_name
-                )
-            } else {
-                format!("CONSUMER.CREATE.{}", self.info.config.name)
-            }
-        };
+    /// Update an existing consumer.
+    /// This call will fail if the consumer does not exist.
+    /// returns the info from the server about updated [Consumer].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::jetstream::consumer;
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// let stream = jetstream.get_stream("events").await?;
+    /// let info = stream
+    ///     .update_consumer(consumer::pull::Config {
+    ///         durable_name: Some("pull".to_string()),
+    ///         ..Default::default()
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "server_2_10")]
+    pub async fn update_consumer<C: IntoConsumerConfig + FromConsumer>(
+        &self,
+        config: C,
+    ) -> Result<Consumer<C>, ConsumerUpdateError> {
+        self.context
+            .update_consumer_on_stream(config, self.info.config.name.clone())
+            .await
+    }
 
-        match self
-            .context
-            .request(
-                subject,
-                &json!({"stream_name": self.info.config.name.clone(), "config": config}),
-            )
-            .await?
-        {
-            Response::Err { error } => Err(ConsumerError::new(ConsumerErrorKind::JetStream(error))),
-            Response::Ok::<consumer::Info>(info) => Ok(Consumer::new(
-                FromConsumer::try_from_consumer_config(info.clone().config)
-                    .map_err(|err| ConsumerError::with_source(ConsumerErrorKind::Other, err))?,
-                info,
-                self.context.clone(),
-            )),
-        }
+    /// Create consumer, but only if it does not exist or the existing config is exactly
+    /// the same.
+    /// This method will fail if consumer is already present with different config.
+    /// returns the info from the server about created [Consumer].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::jetstream::consumer;
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// let stream = jetstream.get_stream("events").await?;
+    /// let info = stream
+    ///     .create_consumer_strict(consumer::pull::Config {
+    ///         durable_name: Some("pull".to_string()),
+    ///         ..Default::default()
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "server_2_10")]
+    pub async fn create_consumer_strict<C: IntoConsumerConfig + FromConsumer>(
+        &self,
+        config: C,
+    ) -> Result<Consumer<C>, ConsumerCreateStrictError> {
+        self.context
+            .create_consumer_strict_on_stream(config, self.info.config.name.clone())
+            .await
     }
 
     /// Retrieve [Info] about [Consumer] from the server.
@@ -1072,6 +1092,10 @@ pub struct Config {
     /// Sets the first sequence for the stream.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "first_seq")]
     pub first_sequence: Option<u64>,
+
+    /// Placement configuration for clusters and tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Placement>,
 }
 
 impl From<&Config> for Config {
@@ -1144,6 +1168,17 @@ pub struct Republish {
     /// If true, only headers should be republished.
     #[serde(default)]
     pub headers_only: bool,
+}
+
+/// Placement describes on which cluster or tags the stream should be placed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Placement {
+    // Cluster where the stream should be placed.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub cluster: Option<String>,
+    // Matching tags for stream placement.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub tags: Vec<String>,
 }
 
 /// `DiscardPolicy` determines how we proceed when limits of messages or bytes are hit. The default, `Old` will
@@ -1664,18 +1699,18 @@ struct ConsumerInfoPage {
 
 type ConsumerNamesErrorKind = StreamsErrorKind;
 type ConsumerNamesError = StreamsError;
-type PageRequest<'a> = BoxFuture<'a, Result<ConsumerPage, RequestError>>;
+type PageRequest = BoxFuture<'static, Result<ConsumerPage, RequestError>>;
 
-pub struct ConsumerNames<'a> {
+pub struct ConsumerNames {
     context: Context,
     stream: String,
     offset: usize,
-    page_request: Option<PageRequest<'a>>,
+    page_request: Option<PageRequest>,
     consumers: Vec<String>,
     done: bool,
 }
 
-impl futures::Stream for ConsumerNames<'_> {
+impl futures::Stream for ConsumerNames {
     type Item = Result<String, ConsumerNamesError>;
 
     fn poll_next(
@@ -1742,18 +1777,18 @@ impl futures::Stream for ConsumerNames<'_> {
 
 pub type ConsumersErrorKind = StreamsErrorKind;
 pub type ConsumersError = StreamsError;
-type PageInfoRequest<'a> = BoxFuture<'a, Result<ConsumerInfoPage, RequestError>>;
+type PageInfoRequest = BoxFuture<'static, Result<ConsumerInfoPage, RequestError>>;
 
-pub struct Consumers<'a> {
+pub struct Consumers {
     context: Context,
     stream: String,
     offset: usize,
-    page_request: Option<PageInfoRequest<'a>>,
+    page_request: Option<PageInfoRequest>,
     consumers: Vec<super::consumer::Info>,
     done: bool,
 }
 
-impl futures::Stream for Consumers<'_> {
+impl futures::Stream for Consumers {
     type Item = Result<super::consumer::Info, ConsumersError>;
 
     fn poll_next(
@@ -1842,6 +1877,7 @@ pub enum ConsumerErrorKind {
     TimedOut,
     Request,
     InvalidConsumerType,
+    InvalidName,
     JetStream(super::errors::Error),
     Other,
 }
@@ -1854,11 +1890,147 @@ impl Display for ConsumerErrorKind {
             Self::JetStream(err) => write!(f, "JetStream error: {}", err),
             Self::Other => write!(f, "consumer error"),
             Self::InvalidConsumerType => write!(f, "invalid consumer type"),
+            Self::InvalidName => write!(f, "invalid consumer name"),
         }
     }
 }
 
 pub type ConsumerError = Error<ConsumerErrorKind>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConsumerCreateStrictErrorKind {
+    //TODO: get last should have timeout, which should be mapped here.
+    TimedOut,
+    Request,
+    InvalidConsumerType,
+    InvalidName,
+    AlreadyExists,
+    JetStream(super::errors::Error),
+    Other,
+}
+
+impl Display for ConsumerCreateStrictErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => write!(f, "timed out"),
+            Self::Request => write!(f, "request failed"),
+            Self::JetStream(err) => write!(f, "JetStream error: {}", err),
+            Self::Other => write!(f, "consumer error"),
+            Self::InvalidConsumerType => write!(f, "invalid consumer type"),
+            Self::InvalidName => write!(f, "invalid consumer name"),
+            Self::AlreadyExists => write!(f, "consumer already exists"),
+        }
+    }
+}
+
+pub type ConsumerCreateStrictError = Error<ConsumerCreateStrictErrorKind>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConsumerUpdateErrorKind {
+    //TODO: get last should have timeout, which should be mapped here.
+    TimedOut,
+    Request,
+    InvalidConsumerType,
+    InvalidName,
+    DoesNotExist,
+    JetStream(super::errors::Error),
+    Other,
+}
+
+impl Display for ConsumerUpdateErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => write!(f, "timed out"),
+            Self::Request => write!(f, "request failed"),
+            Self::JetStream(err) => write!(f, "JetStream error: {}", err),
+            Self::Other => write!(f, "consumer error"),
+            Self::InvalidConsumerType => write!(f, "invalid consumer type"),
+            Self::InvalidName => write!(f, "invalid consumer name"),
+            Self::DoesNotExist => write!(f, "consumer does not exist"),
+        }
+    }
+}
+
+pub type ConsumerUpdateError = Error<ConsumerUpdateErrorKind>;
+
+impl From<super::errors::Error> for ConsumerError {
+    fn from(err: super::errors::Error) -> Self {
+        ConsumerError::new(ConsumerErrorKind::JetStream(err))
+    }
+}
+impl From<super::errors::Error> for ConsumerCreateStrictError {
+    fn from(err: super::errors::Error) -> Self {
+        if err.error_code() == super::errors::ErrorCode::CONSUMER_ALREADY_EXISTS {
+            ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::AlreadyExists)
+        } else {
+            ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::JetStream(err))
+        }
+    }
+}
+impl From<super::errors::Error> for ConsumerUpdateError {
+    fn from(err: super::errors::Error) -> Self {
+        if err.error_code() == super::errors::ErrorCode::CONSUMER_DOES_NOT_EXIST {
+            ConsumerUpdateError::new(ConsumerUpdateErrorKind::DoesNotExist)
+        } else {
+            ConsumerUpdateError::new(ConsumerUpdateErrorKind::JetStream(err))
+        }
+    }
+}
+impl From<ConsumerError> for ConsumerUpdateError {
+    fn from(err: ConsumerError) -> Self {
+        match err.kind() {
+            ConsumerErrorKind::JetStream(err) => {
+                if err.error_code() == super::errors::ErrorCode::CONSUMER_DOES_NOT_EXIST {
+                    ConsumerUpdateError::new(ConsumerUpdateErrorKind::DoesNotExist)
+                } else {
+                    ConsumerUpdateError::new(ConsumerUpdateErrorKind::JetStream(err))
+                }
+            }
+            ConsumerErrorKind::Request => {
+                ConsumerUpdateError::new(ConsumerUpdateErrorKind::Request)
+            }
+            ConsumerErrorKind::TimedOut => {
+                ConsumerUpdateError::new(ConsumerUpdateErrorKind::TimedOut)
+            }
+            ConsumerErrorKind::InvalidConsumerType => {
+                ConsumerUpdateError::new(ConsumerUpdateErrorKind::InvalidConsumerType)
+            }
+            ConsumerErrorKind::InvalidName => {
+                ConsumerUpdateError::new(ConsumerUpdateErrorKind::InvalidName)
+            }
+            ConsumerErrorKind::Other => ConsumerUpdateError::new(ConsumerUpdateErrorKind::Other),
+        }
+    }
+}
+
+impl From<ConsumerError> for ConsumerCreateStrictError {
+    fn from(err: ConsumerError) -> Self {
+        match err.kind() {
+            ConsumerErrorKind::JetStream(err) => {
+                if err.error_code() == super::errors::ErrorCode::CONSUMER_ALREADY_EXISTS {
+                    ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::AlreadyExists)
+                } else {
+                    ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::JetStream(err))
+                }
+            }
+            ConsumerErrorKind::Request => {
+                ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::Request)
+            }
+            ConsumerErrorKind::TimedOut => {
+                ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::TimedOut)
+            }
+            ConsumerErrorKind::InvalidConsumerType => {
+                ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::InvalidConsumerType)
+            }
+            ConsumerErrorKind::InvalidName => {
+                ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::InvalidName)
+            }
+            ConsumerErrorKind::Other => {
+                ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::Other)
+            }
+        }
+    }
+}
 
 impl From<super::context::RequestError> for ConsumerError {
     fn from(err: super::context::RequestError) -> Self {
@@ -1868,9 +2040,25 @@ impl From<super::context::RequestError> for ConsumerError {
         }
     }
 }
-
-impl From<super::errors::Error> for ConsumerError {
-    fn from(err: super::errors::Error) -> Self {
-        ConsumerError::new(ConsumerErrorKind::JetStream(err))
+impl From<super::context::RequestError> for ConsumerUpdateError {
+    fn from(err: super::context::RequestError) -> Self {
+        match err.kind() {
+            RequestErrorKind::TimedOut => {
+                ConsumerUpdateError::new(ConsumerUpdateErrorKind::TimedOut)
+            }
+            _ => ConsumerUpdateError::with_source(ConsumerUpdateErrorKind::Request, err),
+        }
+    }
+}
+impl From<super::context::RequestError> for ConsumerCreateStrictError {
+    fn from(err: super::context::RequestError) -> Self {
+        match err.kind() {
+            RequestErrorKind::TimedOut => {
+                ConsumerCreateStrictError::new(ConsumerCreateStrictErrorKind::TimedOut)
+            }
+            _ => {
+                ConsumerCreateStrictError::with_source(ConsumerCreateStrictErrorKind::Request, err)
+            }
+        }
     }
 }

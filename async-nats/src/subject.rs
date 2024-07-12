@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::str::{from_utf8, Utf8Error};
 
 /// A `Subject` is an immutable string type that guarantees valid UTF-8 contents.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Subject {
     bytes: Bytes,
 }
@@ -21,7 +21,7 @@ impl Subject {
     /// let subject = Subject::from_static("Static string");
     /// assert_eq!(subject.as_str(), "Static string");
     /// ```
-    pub fn from_static(input: &'static str) -> Self {
+    pub const fn from_static(input: &'static str) -> Self {
         Subject {
             bytes: Bytes::from_static(input.as_bytes()),
         }
@@ -65,6 +65,25 @@ impl Subject {
     #[inline]
     pub fn as_str(&self) -> &str {
         self
+    }
+
+    /// Turns the `Subject` into a `String`, consuming it.
+    ///
+    /// Note that this function is not implemented as `From<Subject> for String` as the conversion
+    /// from the underlying type could involve an allocation. If the `Subject` is owned data, it
+    /// will not allocate, but if it was constructed from borrowed data, it will.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_nats::Subject;
+    ///
+    /// let s = Subject::from("foo");
+    /// let sub = s.into_string();
+    /// ```
+    pub fn into_string(self) -> String {
+        // SAFETY: We have guaranteed that the bytes in the `Subject` struct are valid UTF-8.
+        unsafe { String::from_utf8_unchecked(self.bytes.into()) }
     }
 }
 
@@ -130,5 +149,23 @@ impl ToSubject for &'static str {
 impl ToSubject for String {
     fn to_subject(&self) -> Subject {
         Subject::from(self.as_str())
+    }
+}
+
+impl Serialize for Subject {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Subject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(String::deserialize(deserializer)?.into())
     }
 }

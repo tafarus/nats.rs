@@ -38,14 +38,15 @@ mod jetstream {
     };
     use async_nats::jetstream::context::{Publish, PublishErrorKind};
     use async_nats::jetstream::response::Response;
-    use async_nats::jetstream::stream::{self, DiscardPolicy, StorageType};
+    use async_nats::jetstream::stream::{
+        self, ConsumerCreateStrictErrorKind, ConsumerUpdateErrorKind, DiscardPolicy, StorageType,
+    };
     #[cfg(feature = "server_2_10")]
     use async_nats::jetstream::stream::{Compression, ConsumerLimits, Source, SubjectTransform};
     use async_nats::jetstream::AckKind;
     use async_nats::ConnectOptions;
     use futures::stream::{StreamExt, TryStreamExt};
     use time::OffsetDateTime;
-    use tokio_retry::Retry;
     use tracing::debug;
 
     #[tokio::test]
@@ -338,8 +339,7 @@ mod jetstream {
         let client = async_nats::connect(cluster.client_url()).await.unwrap();
         let context = async_nats::jetstream::new(client);
 
-        let retry_strategy = tokio_retry::strategy::FibonacciBackoff::from_millis(500).take(5);
-        let mut stream = Retry::spawn(retry_strategy, || {
+        let mut stream = tryhard::retry_fn(|| {
             context.create_stream(stream::Config {
                 name: "events2".to_string(),
                 num_replicas: 3,
@@ -348,6 +348,8 @@ mod jetstream {
                 ..Default::default()
             })
         })
+        .retries(5)
+        .exponential_backoff(Duration::from_millis(500))
         .await
         .unwrap();
 
@@ -1052,6 +1054,55 @@ mod jetstream {
         let consumer = stream.get_consumer("pull").await.unwrap();
         consumer.fetch().max_messages(10).messages().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn fetch() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(&server.client_url()).await.unwrap();
+        let context = async_nats::jetstream::new(client);
+
+        let stream = context
+            .create_stream(jetstream::stream::Config {
+                name: "events".into(),
+                subjects: vec!["events".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..20 {
+            context.publish("events", "data".into()).await.unwrap();
+        }
+
+        let consumer = stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("pull".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let messages = consumer
+            .fetch()
+            .max_messages(15)
+            .messages()
+            .await
+            .unwrap()
+            .count()
+            .await;
+        assert_eq!(messages, 15);
+
+        let messages = consumer
+            .fetch()
+            .max_messages(15)
+            .messages()
+            .await
+            .unwrap()
+            .count()
+            .await;
+        assert_eq!(messages, 5);
+    }
+
     #[tokio::test]
     async fn get_consumer_from_stream() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
@@ -1079,6 +1130,67 @@ mod jetstream {
             .get_consumer_from_stream("pull", "stream")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_consumer_from_stream() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let context = async_nats::jetstream::new(client);
+
+        let stream = context.get_or_create_stream("stream").await.unwrap();
+        stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("pull".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        stream
+            .create_consumer(consumer::push::Config {
+                durable_name: Some("push".into()),
+                deliver_subject: "subject".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let _consumer = context
+            .delete_consumer_from_stream("pull", "stream")
+            .await
+            .unwrap();
+        assert!(stream
+            .get_consumer::<consumer::Config>("pull")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn create_consumer_on_stream() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let context = async_nats::jetstream::new(client);
+
+        let stream = context.get_or_create_stream("stream").await.unwrap();
+        stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("pull".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let consumer = context
+            .create_consumer_on_stream(
+                consumer::push::Config {
+                    durable_name: Some("push".into()),
+                    deliver_subject: "subject".into(),
+                    ..Default::default()
+                },
+                "stream",
+            )
+            .await
+            .unwrap();
+        assert_eq!(consumer.cached_info().name, "push");
     }
 
     #[tokio::test]
@@ -2263,13 +2375,21 @@ mod jetstream {
                 .unwrap();
         }
 
-        let mut iter = consumer.fetch().max_messages(100).messages().await.unwrap();
+        let mut iter = consumer.batch().max_messages(10).messages().await.unwrap();
         client.flush().await.unwrap();
 
-        // TODO: when rtt() is available, use it here.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let info = consumer.info().await.unwrap();
-        assert_eq!(info.num_ack_pending, 10);
+        tryhard::retry_fn(|| async {
+            let mut consumer = consumer.clone();
+            let num_ack_pending = consumer.info().await?.num_ack_pending;
+            if num_ack_pending != 10 {
+                return Err(format!("expected {}, got {}", 10, num_ack_pending).into());
+            }
+            Ok::<(), async_nats::Error>(())
+        })
+        .retries(10)
+        .exponential_backoff(Duration::from_millis(500))
+        .await
+        .unwrap();
 
         // standard ack
         if let Some(message) = iter.next().await {
@@ -2277,19 +2397,36 @@ mod jetstream {
         }
         client.flush().await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let info = consumer.info().await.unwrap();
-        assert_eq!(info.num_ack_pending, 9);
+        tryhard::retry_fn(|| async {
+            let mut consumer = consumer.clone();
+            let num_ack_pending = consumer.info().await?.num_ack_pending;
+            if num_ack_pending != 9 {
+                return Err(format!("expected {}, got {}", 9, num_ack_pending).into());
+            }
+            Ok::<(), async_nats::Error>(())
+        })
+        .retries(10)
+        .exponential_backoff(Duration::from_millis(500))
+        .await
+        .unwrap();
 
         // double ack
         if let Some(message) = iter.next().await {
             message.unwrap().double_ack().await.unwrap();
         }
-        client.flush().await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let info = consumer.info().await.unwrap();
-        assert_eq!(info.num_ack_pending, 8);
+        tryhard::retry_fn(|| async {
+            let mut consumer = consumer.clone();
+            let num_ack_pending = consumer.info().await?.num_ack_pending;
+            if num_ack_pending != 8 {
+                return Err(format!("expected {}, got {}", 8, num_ack_pending).into());
+            }
+            Ok::<(), async_nats::Error>(())
+        })
+        .retries(10)
+        .exponential_backoff(Duration::from_millis(500))
+        .await
+        .unwrap();
 
         // in progress
         if let Some(message) = iter.next().await {
@@ -2322,8 +2459,7 @@ mod jetstream {
         let jetstream = async_nats::jetstream::new(client.clone());
         // cluster takes some time to spin up.
         // we can have a retry mechanism added later.
-        let retry_strategy = tokio_retry::strategy::FibonacciBackoff::from_millis(500).take(5);
-        let stream = Retry::spawn(retry_strategy, || {
+        let stream = tryhard::retry_fn(|| {
             jetstream.create_stream(async_nats::jetstream::stream::Config {
                 name: "reconnect".into(),
                 subjects: vec!["reconnect.>".into()],
@@ -2331,6 +2467,8 @@ mod jetstream {
                 ..Default::default()
             })
         })
+        .retries(5)
+        .exponential_backoff(Duration::from_secs(1))
         .await
         .unwrap();
 
@@ -3364,10 +3502,14 @@ mod jetstream {
                 max_ack_pending: 150,
             }),
             first_sequence: Some(505),
+            placement: Some(stream::Placement {
+                cluster: Some("CLUSTER".to_string()),
+                tags: vec!["tag".to_string()],
+            }),
         };
 
-        let stream = jetstream.create_stream(config.clone()).await.unwrap();
-        assert_eq!(config, stream.cached_info().to_owned().config);
+        let mut stream = jetstream.create_stream(config.clone()).await.unwrap();
+        assert_eq!(config, stream.info().await.unwrap().config);
     }
 
     #[tokio::test]
@@ -3403,5 +3545,113 @@ mod jetstream {
             .update_stream(config)
             .await
             .expect_err("cannot update stream. consumer `name` exceeds new limits");
+    }
+
+    #[tokio::test]
+    async fn consumer_create_strict() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let jetstream = async_nats::jetstream::new(client);
+
+        let stream = jetstream
+            .create_stream(stream::Config {
+                name: "events".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // crate a consumer
+        stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("name".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // strict create with the same config should be ok.
+        stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("name".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // strict create with different config should fail.
+        let err = stream
+            .create_consumer_strict(consumer::pull::Config {
+                durable_name: Some("name".to_string()),
+                ack_policy: AckPolicy::All,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ConsumerCreateStrictErrorKind::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn consumer_update() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let jetstream = async_nats::jetstream::new(client);
+
+        let stream = jetstream
+            .create_stream(stream::Config {
+                name: "events".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // crate a consumer
+        let consumer = stream
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some("name".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut config = consumer.cached_info().config.clone();
+        config.description = Some("new description".to_string());
+
+        // update existing consumer
+        stream.update_consumer(config).await.unwrap();
+
+        // update non-existing consumer
+        let err = stream
+            .update_consumer(consumer::pull::Config {
+                durable_name: Some("non-existing".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ConsumerUpdateErrorKind::DoesNotExist);
+    }
+
+    #[tokio::test]
+    async fn test_version_on_initial_connect() {
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://localhost:4222")
+            .await
+            .unwrap();
+        let jetstream = async_nats::jetstream::new(client.clone());
+
+        jetstream
+            .create_consumer_on_stream(
+                consumer::pull::Config {
+                    durable_name: Some("name".to_string()),
+                    ..Default::default()
+                },
+                "events",
+            )
+            .await
+            .expect_err("should fail but not panic because of lack of server info");
     }
 }

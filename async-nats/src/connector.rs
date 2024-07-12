@@ -20,6 +20,7 @@ use crate::AuthError;
 use crate::ClientError;
 use crate::ClientOp;
 use crate::ConnectError;
+use crate::ConnectErrorKind;
 use crate::ConnectInfo;
 use crate::Event;
 use crate::Protocol;
@@ -38,9 +39,9 @@ use rand::thread_rng;
 use std::cmp;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::ErrorKind;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tokio_rustls::rustls;
@@ -61,6 +62,7 @@ pub(crate) struct ConnectorOptions {
     pub(crate) read_buffer_capacity: u16,
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
+    pub(crate) max_reconnects: Option<usize>,
 }
 
 /// Maintains a list of servers and establishes connections.
@@ -71,13 +73,14 @@ pub(crate) struct Connector {
     attempts: usize,
     pub(crate) events_tx: tokio::sync::mpsc::Sender<Event>,
     pub(crate) state_tx: tokio::sync::watch::Sender<State>,
+    pub(crate) max_payload: Arc<AtomicUsize>,
 }
 
 pub(crate) fn reconnect_delay_callback_default(attempts: usize) -> Duration {
     if attempts <= 1 {
         Duration::from_millis(0)
     } else {
-        let exp: u32 = (attempts - 1).try_into().unwrap_or(std::u32::MAX);
+        let exp: u32 = (attempts - 1).try_into().unwrap_or(u32::MAX);
         let max = Duration::from_secs(4);
         cmp::min(Duration::from_millis(2_u64.saturating_pow(exp)), max)
     }
@@ -89,6 +92,7 @@ impl Connector {
         options: ConnectorOptions,
         events_tx: tokio::sync::mpsc::Sender<Event>,
         state_tx: tokio::sync::watch::Sender<State>,
+        max_payload: Arc<AtomicUsize>,
     ) -> Result<Connector, io::Error> {
         let servers = addrs.to_server_addrs()?.map(|addr| (addr, 0)).collect();
 
@@ -98,24 +102,34 @@ impl Connector {
             options,
             events_tx,
             state_tx,
+            max_payload,
         })
     }
 
-    pub(crate) async fn connect(&mut self) -> (ServerInfo, Connection) {
+    pub(crate) async fn connect(&mut self) -> Result<(ServerInfo, Connection), ConnectError> {
         loop {
             match self.try_connect().await {
-                Ok(inner) => return inner,
-                Err(error) => {
-                    self.events_tx
-                        .send(Event::ClientError(ClientError::Other(error.to_string())))
-                        .await
-                        .ok();
-                }
+                Ok(inner) => return Ok(inner),
+                Err(error) => match error.kind() {
+                    ConnectErrorKind::MaxReconnects => {
+                        return Err(ConnectError::with_source(
+                            crate::ConnectErrorKind::MaxReconnects,
+                            error,
+                        ))
+                    }
+                    other => {
+                        self.events_tx
+                            .send(Event::ClientError(ClientError::Other(other.to_string())))
+                            .await
+                            .ok();
+                    }
+                },
             }
         }
     }
 
     pub(crate) async fn try_connect(&mut self) -> Result<(ServerInfo, Connection), ConnectError> {
+        tracing::debug!("connecting");
         let mut error = None;
 
         let mut servers = self.servers.clone();
@@ -127,6 +141,15 @@ impl Connector {
 
         for (server_addr, _) in servers {
             self.attempts += 1;
+            if let Some(max_reconnects) = self.options.max_reconnects {
+                if self.attempts > max_reconnects {
+                    self.events_tx
+                        .send(Event::ClientError(ClientError::MaxReconnects))
+                        .await
+                        .ok();
+                    return Err(ConnectError::new(crate::ConnectErrorKind::MaxReconnects));
+                }
+            }
 
             let duration = (self.options.reconnect_delay_callback)(self.attempts);
 
@@ -134,6 +157,7 @@ impl Connector {
 
             let socket_addrs = server_addr
                 .socket_addrs()
+                .await
                 .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Dns, err))?;
             for socket_addr in socket_addrs {
                 match self
@@ -258,9 +282,14 @@ impl Connector {
                                 }
                             },
                             Some(_) => {
+                                tracing::debug!("connected to {}", server_info.port);
                                 self.attempts = 0;
                                 self.events_tx.send(Event::Connected).await.ok();
                                 self.state_tx.send(State::Connected).ok();
+                                self.max_payload.store(
+                                    server_info.max_payload,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 return Ok((server_info, connection));
                             }
                             None => {
@@ -306,19 +335,14 @@ impl Connector {
                     .await
                     .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Tls, err))?,
             );
-            let tls_connector = tokio_rustls::TlsConnector::try_from(tls_config)
-                .map_err(|err| {
-                    io::Error::new(
-                        ErrorKind::Other,
-                        format!("failed to create TLS connector from TLS config: {err}"),
-                    )
-                })
+            let tls_connector = tokio_rustls::TlsConnector::from(tls_config);
+
+            let domain = webpki::types::ServerName::try_from(tls_host)
                 .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Tls, err))?;
 
-            let domain = rustls::ServerName::try_from(tls_host)
-                .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Tls, err))?;
-
-            let tls_stream = tls_connector.connect(domain, connection.stream).await?;
+            let tls_stream = tls_connector
+                .connect(domain.to_owned(), connection.stream)
+                .await?;
 
             Ok::<Connection, ConnectError>(Connection::new(Box::new(tls_stream), 0))
         };

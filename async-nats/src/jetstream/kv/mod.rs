@@ -38,7 +38,7 @@ use super::{
     consumer::{push::OrderedError, DeliverPolicy, StreamError, StreamErrorKind},
     context::{PublishError, PublishErrorKind},
     stream::{
-        ConsumerError, ConsumerErrorKind, DirectGetError, DirectGetErrorKind, RawMessage,
+        self, ConsumerError, ConsumerErrorKind, DirectGetError, DirectGetErrorKind, RawMessage,
         Republish, Source, StorageType, Stream,
     },
 };
@@ -123,6 +123,8 @@ pub struct Config {
     /// Compression
     #[cfg(feature = "server_2_10")]
     pub compression: bool,
+    /// Cluster and tag placement for the bucket.
+    pub placement: Option<stream::Placement>,
 }
 
 /// Describes what kind of operation and entry represents
@@ -207,6 +209,60 @@ impl Store {
             info,
             bucket: self.name.to_string(),
         })
+    }
+
+    /// Create will add the key/value pair if it does not exist. If it does exist, it will return an error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("demo.nats.io:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    /// let kv = jetstream
+    ///     .create_key_value(async_nats::jetstream::kv::Config {
+    ///         bucket: "kv".to_string(),
+    ///         history: 10,
+    ///         ..Default::default()
+    ///     })
+    ///     .await?;
+    ///
+    /// let status = kv.create("key", "value".into()).await;
+    /// assert!(status.is_ok());
+    ///
+    /// let status = kv.create("key", "value".into()).await;
+    /// assert!(status.is_err());
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn create<T: AsRef<str>>(
+        &self,
+        key: T,
+        value: bytes::Bytes,
+    ) -> Result<u64, CreateError> {
+        let update_err = match self.update(key.as_ref(), value.clone(), 0).await {
+            Ok(revision) => return Ok(revision),
+            Err(err) => err,
+        };
+
+        match self.entry(key.as_ref()).await? {
+            // Deleted or Purged key, we can create it again.
+            Some(Entry {
+                operation: Operation::Delete | Operation::Purge,
+                ..
+            }) => {
+                let revision = self.put(key, value).await?;
+                Ok(revision)
+            }
+
+            // key already exists.
+            Some(_) => Err(CreateError::new(CreateErrorKind::AlreadyExists)),
+
+            // Something went wrong with the initial update, return that error
+            None => Err(update_err.into()),
+        }
     }
 
     /// Puts new key value pair into the bucket.
@@ -303,7 +359,7 @@ impl Store {
                             kv_operation_from_message(&message).unwrap_or(Operation::Put);
 
                         let sequence = headers
-                            .get(header::NATS_SEQUENCE)
+                            .get_last(header::NATS_SEQUENCE)
                             .ok_or_else(|| {
                                 EntryError::with_source(
                                     EntryErrorKind::Other,
@@ -320,7 +376,7 @@ impl Store {
                             })?;
 
                         let created = headers
-                            .get(header::NATS_TIME_STAMP)
+                            .get_last(header::NATS_TIME_STAMP)
                             .ok_or_else(|| {
                                 EntryError::with_source(
                                     EntryErrorKind::Other,
@@ -427,9 +483,49 @@ impl Store {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn watch<T: AsRef<str>>(&self, key: T) -> Result<Watch<'_>, WatchError> {
+    pub async fn watch<T: AsRef<str>>(&self, key: T) -> Result<Watch, WatchError> {
         self.watch_with_deliver_policy(key, DeliverPolicy::New)
             .await
+    }
+
+    /// Creates a [futures::Stream] over [Entries][Entry] a given key in the bucket, starting from
+    /// provided revision. This is useful to resume watching over big KV buckets without a need to
+    /// replay all the history.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use futures::StreamExt;
+    /// let client = async_nats::connect("demo.nats.io:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    /// let kv = jetstream
+    ///     .create_key_value(async_nats::jetstream::kv::Config {
+    ///         bucket: "kv".to_string(),
+    ///         history: 10,
+    ///         ..Default::default()
+    ///     })
+    ///     .await?;
+    /// let mut entries = kv.watch_from_revision("kv", 5).await?;
+    /// while let Some(entry) = entries.next().await {
+    ///     println!("entry: {:?}", entry);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn watch_from_revision<T: AsRef<str>>(
+        &self,
+        key: T,
+        revision: u64,
+    ) -> Result<Watch, WatchError> {
+        self.watch_with_deliver_policy(
+            key,
+            DeliverPolicy::ByStartSequence {
+                start_sequence: revision,
+            },
+        )
+        .await
     }
 
     /// Creates a [futures::Stream] over [Entries][Entry]  a given key in the bucket, which yields
@@ -457,7 +553,7 @@ impl Store {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn watch_with_history<T: AsRef<str>>(&self, key: T) -> Result<Watch<'_>, WatchError> {
+    pub async fn watch_with_history<T: AsRef<str>>(&self, key: T) -> Result<Watch, WatchError> {
         self.watch_with_deliver_policy(key, DeliverPolicy::LastPerSubject)
             .await
     }
@@ -466,7 +562,7 @@ impl Store {
         &self,
         key: T,
         deliver_policy: DeliverPolicy,
-    ) -> Result<Watch<'_>, WatchError> {
+    ) -> Result<Watch, WatchError> {
         let subject = format!("{}{}", self.prefix.as_str(), key.as_ref());
 
         debug!("initial consumer creation");
@@ -527,8 +623,38 @@ impl Store {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn watch_all(&self) -> Result<Watch<'_>, WatchError> {
+    pub async fn watch_all(&self) -> Result<Watch, WatchError> {
         self.watch(ALL_KEYS).await
+    }
+
+    /// Creates a [futures::Stream] over [Entries][Entry] for all keys starting
+    /// from a provider revision. This can be useful when resuming watching over a big bucket
+    /// without the need to replay all the history.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use futures::StreamExt;
+    /// let client = async_nats::connect("demo.nats.io:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    /// let kv = jetstream
+    ///     .create_key_value(async_nats::jetstream::kv::Config {
+    ///         bucket: "kv".to_string(),
+    ///         history: 10,
+    ///         ..Default::default()
+    ///     })
+    ///     .await?;
+    /// let mut entries = kv.watch_all_from_revision(40).await?;
+    /// while let Some(entry) = entries.next().await {
+    ///     println!("entry: {:?}", entry);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn watch_all_from_revision(&self, revision: u64) -> Result<Watch, WatchError> {
+        self.watch_from_revision(ALL_KEYS, revision).await
     }
 
     /// Retrieves the [Entry] for a given key from a bucket.
@@ -649,6 +775,37 @@ impl Store {
     /// # }
     /// ```
     pub async fn delete<T: AsRef<str>>(&self, key: T) -> Result<(), DeleteError> {
+        self.delete_expect_revision(key, None).await
+    }
+
+    /// Deletes a given key if the revision matches. This is a non-destructive operation, which
+    /// sets a `DELETE` marker.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use futures::StreamExt;
+    /// let client = async_nats::connect("demo.nats.io:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    /// let kv = jetstream
+    ///     .create_key_value(async_nats::jetstream::kv::Config {
+    ///         bucket: "kv".to_string(),
+    ///         history: 10,
+    ///         ..Default::default()
+    ///     })
+    ///     .await?;
+    /// let revision = kv.put("key", "value".into()).await?;
+    /// kv.delete_expect_revision("key", Some(revision)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_expect_revision<T: AsRef<str>>(
+        &self,
+        key: T,
+        revison: Option<u64>,
+    ) -> Result<(), DeleteError> {
         if !is_valid_key(key.as_ref()) {
             return Err(DeleteError::new(DeleteErrorKind::InvalidKey));
         }
@@ -668,6 +825,13 @@ impl Store {
                 .parse::<HeaderValue>()
                 .map_err(|err| DeleteError::with_source(DeleteErrorKind::Other, err))?,
         );
+
+        if let Some(revision) = revison {
+            headers.insert(
+                header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+                HeaderValue::from(revision),
+            );
+        }
 
         self.stream
             .context
@@ -701,6 +865,38 @@ impl Store {
     /// # }
     /// ```
     pub async fn purge<T: AsRef<str>>(&self, key: T) -> Result<(), PurgeError> {
+        self.purge_expect_revision(key, None).await
+    }
+
+    /// Purges all the revisions of a entry destructively if the revision matches, leaving behind a single
+    /// purge entry in-place.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use futures::StreamExt;
+    /// let client = async_nats::connect("demo.nats.io:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    /// let kv = jetstream
+    ///     .create_key_value(async_nats::jetstream::kv::Config {
+    ///         bucket: "kv".to_string(),
+    ///         history: 10,
+    ///         ..Default::default()
+    ///     })
+    ///     .await?;
+    /// kv.put("key", "value".into()).await?;
+    /// let revision = kv.put("key", "another".into()).await?;
+    /// kv.purge_expect_revision("key", Some(revision)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn purge_expect_revision<T: AsRef<str>>(
+        &self,
+        key: T,
+        revison: Option<u64>,
+    ) -> Result<(), PurgeError> {
         if !is_valid_key(key.as_ref()) {
             return Err(PurgeError::new(PurgeErrorKind::InvalidKey));
         }
@@ -716,6 +912,13 @@ impl Store {
         let mut headers = crate::HeaderMap::default();
         headers.insert(KV_OPERATION, HeaderValue::from(KV_OPERATION_PURGE));
         headers.insert(NATS_ROLLUP, HeaderValue::from(ROLLUP_SUBJECT));
+
+        if let Some(revision) = revison {
+            headers.insert(
+                header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+                HeaderValue::from(revision),
+            );
+        }
 
         self.stream
             .context
@@ -750,7 +953,7 @@ impl Store {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn history<T: AsRef<str>>(&self, key: T) -> Result<History<'_>, HistoryError> {
+    pub async fn history<T: AsRef<str>>(&self, key: T) -> Result<History, HistoryError> {
         if !is_valid_key(key.as_ref()) {
             return Err(HistoryError::new(HistoryErrorKind::InvalidKey));
         }
@@ -851,13 +1054,13 @@ impl Store {
 }
 
 /// A structure representing a watch on a key-value bucket, yielding values whenever there are changes.
-pub struct Watch<'a> {
-    subscription: super::consumer::push::Ordered<'a>,
+pub struct Watch {
+    subscription: super::consumer::push::Ordered,
     prefix: String,
     bucket: String,
 }
 
-impl<'a> futures::Stream for Watch<'a> {
+impl futures::Stream for Watch {
     type Item = Result<Entry, WatcherError>;
 
     fn poll_next(
@@ -905,14 +1108,14 @@ impl<'a> futures::Stream for Watch<'a> {
 }
 
 /// A structure representing the history of a key-value bucket, yielding past values.
-pub struct History<'a> {
-    subscription: super::consumer::push::Ordered<'a>,
+pub struct History {
+    subscription: super::consumer::push::Ordered,
     done: bool,
     prefix: String,
     bucket: String,
 }
 
-impl<'a> futures::Stream for History<'a> {
+impl futures::Stream for History {
     type Item = Result<Entry, WatcherError>;
 
     fn poll_next(
@@ -965,11 +1168,11 @@ impl<'a> futures::Stream for History<'a> {
     }
 }
 
-pub struct Keys<'a> {
-    inner: History<'a>,
+pub struct Keys {
+    inner: History,
 }
 
-impl<'a> futures::Stream for Keys<'a> {
+impl futures::Stream for Keys {
     type Item = Result<String, WatcherError>;
 
     fn poll_next(
@@ -1032,6 +1235,59 @@ impl Display for StatusErrorKind {
 }
 
 pub type StatusError = Error<StatusErrorKind>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CreateErrorKind {
+    AlreadyExists,
+    InvalidKey,
+    Publish,
+    Ack,
+    Other,
+}
+
+impl From<UpdateError> for CreateError {
+    fn from(error: UpdateError) -> Self {
+        match error.kind() {
+            UpdateErrorKind::InvalidKey => Error::from(CreateErrorKind::InvalidKey),
+            UpdateErrorKind::TimedOut => Error::from(CreateErrorKind::Publish),
+            UpdateErrorKind::Other => Error::from(CreateErrorKind::Other),
+        }
+    }
+}
+
+impl From<PutError> for CreateError {
+    fn from(error: PutError) -> Self {
+        match error.kind() {
+            PutErrorKind::InvalidKey => Error::from(CreateErrorKind::InvalidKey),
+            PutErrorKind::Publish => Error::from(CreateErrorKind::Publish),
+            PutErrorKind::Ack => Error::from(CreateErrorKind::Ack),
+        }
+    }
+}
+
+impl From<EntryError> for CreateError {
+    fn from(error: EntryError) -> Self {
+        match error.kind() {
+            EntryErrorKind::InvalidKey => Error::from(CreateErrorKind::InvalidKey),
+            EntryErrorKind::TimedOut => Error::from(CreateErrorKind::Publish),
+            EntryErrorKind::Other => Error::from(CreateErrorKind::Other),
+        }
+    }
+}
+
+impl Display for CreateErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyExists => write!(f, "key already exists"),
+            Self::Publish => write!(f, "failed to create key in store"),
+            Self::Ack => write!(f, "ack error"),
+            Self::InvalidKey => write!(f, "key cannot be empty or start/end with `.`"),
+            Self::Other => write!(f, "other error"),
+        }
+    }
+}
+
+pub type CreateError = Error<CreateErrorKind>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PutErrorKind {
@@ -1146,11 +1402,11 @@ impl From<OrderedError> for WatcherError {
     }
 }
 
-type DeleteError = UpdateError;
-type DeleteErrorKind = UpdateErrorKind;
+pub type DeleteError = UpdateError;
+pub type DeleteErrorKind = UpdateErrorKind;
 
-type PurgeError = UpdateError;
-type PurgeErrorKind = UpdateErrorKind;
+pub type PurgeError = UpdateError;
+pub type PurgeErrorKind = UpdateErrorKind;
 
-type HistoryError = WatchError;
-type HistoryErrorKind = WatchErrorKind;
+pub type HistoryError = WatchError;
+pub type HistoryErrorKind = WatchErrorKind;

@@ -84,6 +84,10 @@
 //! for _ in 0..10 {
 //!     client.publish(subject, data.clone()).await?;
 //! }
+//!
+//! // Flush internal buffer before exiting to make sure all messages are sent
+//! client.flush().await?;
+//!
 //! #    Ok(())
 //! # }
 //! ```
@@ -193,6 +197,7 @@
 use thiserror::Error;
 
 use futures::stream::Stream;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 use tracing::{debug, error};
 
@@ -202,11 +207,13 @@ use std::fmt::Display;
 use std::future::Future;
 use std::iter;
 use std::mem;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::option;
 use std::pin::Pin;
 use std::slice;
 use std::str::{self, FromStr};
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::ErrorKind;
 use tokio::time::{interval, Duration, Interval, MissedTickBehavior};
@@ -247,6 +254,7 @@ pub use auth::Auth;
 pub use client::{Client, PublishError, Request, RequestError, RequestErrorKind, SubscribeError};
 pub use options::{AuthError, ConnectOptions};
 
+mod crypto;
 pub mod error;
 pub mod header;
 pub mod jetstream;
@@ -362,6 +370,7 @@ pub(crate) enum Command {
     Flush {
         observer: oneshot::Sender<()>,
     },
+    Reconnect,
 }
 
 /// `ClientOp` represents all actions of `Client`.
@@ -412,7 +421,7 @@ pub(crate) struct ConnectionHandler {
     pending_pings: usize,
     info_sender: tokio::sync::watch::Sender<ServerInfo>,
     ping_interval: Interval,
-    is_flushing: bool,
+    should_reconnect: bool,
     flush_observers: Vec<oneshot::Sender<()>>,
 }
 
@@ -434,7 +443,7 @@ impl ConnectionHandler {
             pending_pings: 0,
             info_sender,
             ping_interval,
-            is_flushing: false,
+            should_reconnect: false,
             flush_observers: Vec::new(),
         }
     }
@@ -443,14 +452,18 @@ impl ConnectionHandler {
         struct ProcessFut<'a> {
             handler: &'a mut ConnectionHandler,
             receiver: &'a mut mpsc::Receiver<Command>,
+            recv_buf: &'a mut Vec<Command>,
         }
 
         enum ExitReason {
             Disconnected(Option<io::Error>),
+            ReconnectRequested,
             Closed,
         }
 
         impl<'a> ProcessFut<'a> {
+            const RECV_CHUNK_SIZE: usize = 16;
+
             #[cold]
             fn ping(&mut self) -> Poll<ExitReason> {
                 self.handler.pending_pings += 1;
@@ -487,7 +500,10 @@ impl ConnectionHandler {
             ///   [`Self::receiver`] was closed, so there's nothing
             ///   more for us to do than to exit the client.
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                if self.handler.ping_interval.poll_tick(cx).is_ready() {
+                // We need to be sure the waker is registered, therefore we need to poll until we
+                // get a `Poll::Pending`. With a sane interval delay, this means that the loop
+                // breaks at the second iteration.
+                while self.handler.ping_interval.poll_tick(cx).is_ready() {
                     if let Poll::Ready(exit) = self.ping() {
                         return Poll::Ready(exit);
                     }
@@ -516,13 +532,24 @@ impl ConnectionHandler {
                 let mut made_progress = true;
                 loop {
                     while !self.handler.connection.is_write_buf_full() {
-                        match self.receiver.poll_recv(cx) {
+                        debug_assert!(self.recv_buf.is_empty());
+
+                        let Self {
+                            recv_buf,
+                            handler,
+                            receiver,
+                        } = &mut *self;
+                        match receiver.poll_recv_many(cx, recv_buf, Self::RECV_CHUNK_SIZE) {
                             Poll::Pending => break,
-                            Poll::Ready(Some(cmd)) => {
+                            Poll::Ready(1..) => {
                                 made_progress = true;
-                                self.handler.handle_command(cmd);
+
+                                for cmd in recv_buf.drain(..) {
+                                    handler.handle_command(cmd);
+                                }
                             }
-                            Poll::Ready(None) => return Poll::Ready(ExitReason::Closed),
+                            // TODO: replace `_` with `0` after bumping MSRV to 1.75
+                            Poll::Ready(_) => return Poll::Ready(ExitReason::Closed),
                         }
                     }
 
@@ -555,12 +582,13 @@ impl ConnectionHandler {
                     }
                 }
 
-                if self.handler.is_flushing || self.handler.connection.should_flush() {
+                if let (ShouldFlush::Yes, _) | (ShouldFlush::No, false) = (
+                    self.handler.connection.should_flush(),
+                    self.handler.flush_observers.is_empty(),
+                ) {
                     match self.handler.connection.poll_flush(cx) {
                         Poll::Pending => {}
                         Poll::Ready(Ok(())) => {
-                            self.handler.is_flushing = false;
-
                             for observer in self.handler.flush_observers.drain(..) {
                                 let _ = observer.send(());
                             }
@@ -571,23 +599,38 @@ impl ConnectionHandler {
                     }
                 }
 
+                if mem::take(&mut self.handler.should_reconnect) {
+                    return Poll::Ready(ExitReason::ReconnectRequested);
+                }
+
                 Poll::Pending
             }
         }
 
+        let mut recv_buf = Vec::with_capacity(ProcessFut::RECV_CHUNK_SIZE);
         loop {
             let process = ProcessFut {
                 handler: self,
                 receiver,
+                recv_buf: &mut recv_buf,
             };
             match process.await {
                 ExitReason::Disconnected(err) => {
                     debug!(?err, "disconnected");
-
-                    self.handle_disconnect().await;
+                    if self.handle_disconnect().await.is_err() {
+                        break;
+                    };
                     debug!("reconnected");
                 }
                 ExitReason::Closed => break,
+                ExitReason::ReconnectRequested => {
+                    debug!("reconnect requested");
+                    // Should be ok to ingore error, as that means we are not in connected state.
+                    self.connection.stream.shutdown().await.ok();
+                    if self.handle_disconnect().await.is_err() {
+                        break;
+                    };
+                }
             }
         }
     }
@@ -715,7 +758,6 @@ impl ConnectionHandler {
                 }
             }
             Command::Flush { observer } => {
-                self.is_flushing = true;
                 self.flush_observers.push(observer);
             }
             Command::Subscribe {
@@ -793,19 +835,23 @@ impl ConnectionHandler {
                     headers,
                 });
             }
+
+            Command::Reconnect => {
+                self.should_reconnect = true;
+            }
         }
     }
 
-    async fn handle_disconnect(&mut self) {
+    async fn handle_disconnect(&mut self) -> Result<(), ConnectError> {
         self.pending_pings = 0;
         self.connector.events_tx.try_send(Event::Disconnected).ok();
         self.connector.state_tx.send(State::Disconnected).ok();
 
-        self.handle_reconnect().await;
+        self.handle_reconnect().await
     }
 
-    async fn handle_reconnect(&mut self) {
-        let (info, connection) = self.connector.connect().await;
+    async fn handle_reconnect(&mut self) -> Result<(), ConnectError> {
+        let (info, connection) = self.connector.connect().await?;
         self.connection = connection;
         let _ = self.info_sender.send(info);
 
@@ -827,8 +873,7 @@ impl ConnectionHandler {
                 queue_group: None,
             });
         }
-
-        self.connector.events_tx.try_send(Event::Connected).ok();
+        Ok(())
     }
 }
 
@@ -855,6 +900,8 @@ pub async fn connect_with_options<A: ToServerAddrs>(
 
     let (events_tx, mut events_rx) = mpsc::channel(128);
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Pending);
+    // We're setting it to the default server payload size.
+    let max_payload = Arc::new(AtomicUsize::new(1024 * 1024));
 
     let mut connector = Connector::new(
         addrs,
@@ -874,9 +921,11 @@ pub async fn connect_with_options<A: ToServerAddrs>(
             read_buffer_capacity: options.read_buffer_capacity,
             reconnect_delay_callback: options.reconnect_delay_callback,
             auth_callback: options.auth_callback,
+            max_reconnects: options.max_reconnects,
         },
         events_tx,
         state_tx,
+        max_payload.clone(),
     )
     .map_err(|err| ConnectError::with_source(ConnectErrorKind::ServerParse, err))?;
 
@@ -889,7 +938,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         info = info_ok;
     }
 
-    let (info_sender, info_watcher) = tokio::sync::watch::channel(info);
+    let (info_sender, info_watcher) = tokio::sync::watch::channel(info.clone());
     let (sender, mut receiver) = mpsc::channel(options.sender_capacity);
 
     let client = Client::new(
@@ -899,17 +948,27 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         options.subscription_capacity,
         options.inbox_prefix,
         options.request_timeout,
+        max_payload,
     );
 
     task::spawn(async move {
         while let Some(event) = events_rx.recv().await {
-            options.event_callback.call(event).await
+            tracing::info!("event: {}", event);
+            if let Some(event_callback) = &options.event_callback {
+                event_callback.call(event).await;
+            }
         }
     });
 
     task::spawn(async move {
         if connection.is_none() && options.retry_on_initial_connect {
-            let (info, connection_ok) = connector.connect().await;
+            let (info, connection_ok) = match connector.connect().await {
+                Ok((info, connection)) => (info, connection),
+                Err(err) => {
+                    error!("connection closed: {}", err);
+                    return;
+                }
+            };
             info_sender.send(info).ok();
             connection = Some(connection_ok);
         }
@@ -1031,6 +1090,8 @@ pub enum ConnectErrorKind {
     Tls,
     /// Other IO error.
     Io,
+    /// Reached the maximum number of reconnects.
+    MaxReconnects,
 }
 
 impl Display for ConnectErrorKind {
@@ -1043,6 +1104,7 @@ impl Display for ConnectErrorKind {
             Self::TimedOut => write!(f, "timed out"),
             Self::Tls => write!(f, "TLS error"),
             Self::Io => write!(f, "IO error"),
+            Self::MaxReconnects => write!(f, "reached maximum number of reconnects"),
         }
     }
 }
@@ -1221,11 +1283,13 @@ pub enum ServerError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientError {
     Other(String),
+    MaxReconnects,
 }
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Other(error) => write!(f, "nats: {error}"),
+            Self::MaxReconnects => write!(f, "nats: max reconnects reached"),
         }
     }
 }
@@ -1234,7 +1298,8 @@ impl ServerError {
     fn new(error: String) -> ServerError {
         match error.to_lowercase().as_str() {
             "authorization violation" => ServerError::AuthorizationViolation,
-            other => ServerError::Other(other.to_string()),
+            // error messages can contain case-sensitive values which should be preserved
+            _ => ServerError::Other(error),
         }
     }
 }
@@ -1409,8 +1474,8 @@ impl ServerAddr {
     }
 
     /// Return the sockets from resolving the server address.
-    pub fn socket_addrs(&self) -> io::Result<impl Iterator<Item = SocketAddr>> {
-        (self.host(), self.port()).to_socket_addrs()
+    pub async fn socket_addrs(&self) -> io::Result<impl Iterator<Item = SocketAddr> + '_> {
+        tokio::net::lookup_host((self.host(), self.port())).await
     }
 }
 
@@ -1423,7 +1488,6 @@ pub trait ToServerAddrs {
     /// to.
     type Iter: Iterator<Item = ServerAddr>;
 
-    ///
     fn to_server_addrs(&self) -> io::Result<Self::Iter>;
 }
 
@@ -1446,6 +1510,24 @@ impl ToServerAddrs for String {
     type Iter = option::IntoIter<ServerAddr>;
     fn to_server_addrs(&self) -> io::Result<Self::Iter> {
         (**self).to_server_addrs()
+    }
+}
+
+impl<T: AsRef<str>> ToServerAddrs for [T] {
+    type Iter = std::vec::IntoIter<ServerAddr>;
+    fn to_server_addrs(&self) -> io::Result<Self::Iter> {
+        self.iter()
+            .map(AsRef::as_ref)
+            .map(str::parse)
+            .collect::<io::Result<_>>()
+            .map(Vec::into_iter)
+    }
+}
+
+impl<T: AsRef<str>> ToServerAddrs for Vec<T> {
+    type Iter = std::vec::IntoIter<ServerAddr>;
+    fn to_server_addrs(&self) -> io::Result<Self::Iter> {
+        self.as_slice().to_server_addrs()
     }
 }
 
@@ -1490,6 +1572,8 @@ macro_rules! from_with_timeout {
 }
 pub(crate) use from_with_timeout;
 
+use crate::connection::ShouldFlush;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1510,5 +1594,41 @@ mod tests {
     fn server_address_domain() {
         let address = ServerAddr::from_str("nats://example.com").unwrap();
         assert_eq!(address.host(), "example.com")
+    }
+
+    #[test]
+    fn to_server_addrs_vec_str() {
+        let vec = vec!["nats://127.0.0.1", "nats://[::]"];
+        let mut addrs_iter = vec.to_server_addrs().unwrap();
+        assert_eq!(addrs_iter.next().unwrap().host(), "127.0.0.1");
+        assert_eq!(addrs_iter.next().unwrap().host(), "::");
+        assert_eq!(addrs_iter.next(), None);
+    }
+
+    #[test]
+    fn to_server_addrs_arr_str() {
+        let arr = ["nats://127.0.0.1", "nats://[::]"];
+        let mut addrs_iter = arr.to_server_addrs().unwrap();
+        assert_eq!(addrs_iter.next().unwrap().host(), "127.0.0.1");
+        assert_eq!(addrs_iter.next().unwrap().host(), "::");
+        assert_eq!(addrs_iter.next(), None);
+    }
+
+    #[test]
+    fn to_server_addrs_vec_string() {
+        let vec = vec!["nats://127.0.0.1".to_string(), "nats://[::]".to_string()];
+        let mut addrs_iter = vec.to_server_addrs().unwrap();
+        assert_eq!(addrs_iter.next().unwrap().host(), "127.0.0.1");
+        assert_eq!(addrs_iter.next().unwrap().host(), "::");
+        assert_eq!(addrs_iter.next(), None);
+    }
+
+    #[test]
+    fn to_server_addrs_arr_string() {
+        let arr = ["nats://127.0.0.1".to_string(), "nats://[::]".to_string()];
+        let mut addrs_iter = arr.to_server_addrs().unwrap();
+        assert_eq!(addrs_iter.next().unwrap().host(), "127.0.0.1");
+        assert_eq!(addrs_iter.next().unwrap().host(), "::");
+        assert_eq!(addrs_iter.next(), None);
     }
 }

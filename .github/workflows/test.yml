@@ -41,7 +41,7 @@ jobs:
         id:   setup-go
         uses: actions/setup-go@v4 # v4 uses caching out of the box
         with:
-          go-version: '1.20'
+          go-version: '1.22'
       - name: Install nats-server
         run:  go install github.com/nats-io/nats-server/v2@main
       - name: Install stable Rust on ${{ matrix.os }}
@@ -102,7 +102,7 @@ jobs:
           save-if: false # the linter only run checks but not builds, so we don't have the full build to be cached.
 
       - name: Run linter
-        run: cargo clippy --benches --tests --examples --all-features -- --deny clippy::all
+        run: cargo clippy --benches --tests --examples --all-features --workspace --exclude nats -- --deny clippy::all
 
   check_docs:
     name: check docs (ubuntu-latest / stable)
@@ -121,7 +121,27 @@ jobs:
           save-if: false # we only build docs, so we don't have the full build to be cached.
 
       - name: Check lint
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --all-features
+
+  check_features:
+    name: check feature flags (ubuntu-latest / stable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+      - name: Install stable Rust on ubuntu-latest
+        id:   install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Restore cached build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
+          save-if: false # we only build docs, so we don't have the full build to be cached.
+      - name: Install cargo hack
+        run: cargo install cargo-hack
+      - name: Check lint
+        run: cargo hack check --feature-powerset --at-least-one-of aws-lc-rs,ring --no-dev-deps -p async-nats
+
 
   check_licenses:
     name: check licenses (ubuntu-latest / stable)
@@ -202,3 +222,31 @@ jobs:
 
       - name: Check spelling
         run: cargo spellcheck --code 1
+
+  check_min_versions:
+    name: check minimal versions of transitive dependencies (ubuntu-latest / stable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly for -Zminimal-versions
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Lock minimal versions
+        # Update openssl-sys to not depend on the stale libssl-dev package.
+        run: |
+          cargo +nightly update -Zminimal-versions
+          cargo +nightly update -p openssl-sys -p openssl
+
+      - name: Install stable
+        id:   install-stable-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Restore cached build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-stable-rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+      - name: Run the check
+        env:
+          RUST_BACKTRACE: 1
+        # cannot check against all packages because min versions of nats@0.16.0 are broken
+        run: cargo +${{ steps.install-stable-rust.outputs.name }} check --package async-nats --locked --all-features --all-targets

@@ -21,9 +21,10 @@ use bytes::Bytes;
 use futures::future::TryFutureExt;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
+use portable_atomic::AtomicU64;
 use regex::Regex;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -35,13 +36,26 @@ static VERSION_RE: Lazy<Regex> =
 
 /// An error returned from the [`Client::publish`], [`Client::publish_with_headers`],
 /// [`Client::publish_with_reply`] or [`Client::publish_with_reply_and_headers`] functions.
-#[derive(Debug, Error)]
-#[error("failed to publish message: {0}")]
-pub struct PublishError(#[source] crate::Error);
+pub type PublishError = Error<PublishErrorKind>;
 
 impl From<tokio::sync::mpsc::error::SendError<Command>> for PublishError {
     fn from(err: tokio::sync::mpsc::error::SendError<Command>) -> Self {
-        PublishError(Box::new(err))
+        PublishError::with_source(PublishErrorKind::Send, err)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PublishErrorKind {
+    MaxPayloadExceeded,
+    Send,
+}
+
+impl Display for PublishErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PublishErrorKind::MaxPayloadExceeded => write!(f, "max payload size exceeded"),
+            PublishErrorKind::Send => write!(f, "failed to send message"),
+        }
     }
 }
 
@@ -55,8 +69,9 @@ pub struct Client {
     pub(crate) sender: mpsc::Sender<Command>,
     next_subscription_id: Arc<AtomicU64>,
     subscription_capacity: usize,
-    inbox_prefix: String,
+    inbox_prefix: Arc<str>,
     request_timeout: Option<Duration>,
+    max_payload: Arc<AtomicUsize>,
 }
 
 impl Client {
@@ -67,6 +82,7 @@ impl Client {
         capacity: usize,
         inbox_prefix: String,
         request_timeout: Option<Duration>,
+        max_payload: Arc<AtomicUsize>,
     ) -> Client {
         Client {
             info,
@@ -74,8 +90,9 @@ impl Client {
             sender,
             next_subscription_id: Arc::new(AtomicU64::new(1)),
             subscription_capacity: capacity,
-            inbox_prefix,
+            inbox_prefix: inbox_prefix.into(),
             request_timeout,
+            max_payload,
         }
     }
 
@@ -98,6 +115,10 @@ impl Client {
 
     /// Returns true if the server version is compatible with the version components.
     ///
+    /// This has to be used with caution, as it is not guaranteed that the server
+    /// that client is connected to is the same version that the one that is
+    /// a JetStream meta/stream/consumer leader, especially across leafnodes.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -111,7 +132,10 @@ impl Client {
     pub fn is_server_compatible(&self, major: i64, minor: i64, patch: i64) -> bool {
         let info = self.server_info();
 
-        let server_version_captures = VERSION_RE.captures(&info.version).unwrap();
+        let server_version_captures = match VERSION_RE.captures(&info.version) {
+            Some(captures) => captures,
+            None => return false,
+        };
 
         let server_major = server_version_captures
             .get(1)
@@ -154,6 +178,17 @@ impl Client {
         payload: Bytes,
     ) -> Result<(), PublishError> {
         let subject = subject.to_subject();
+        let max_payload = self.max_payload.load(Ordering::Relaxed);
+        if payload.len() > max_payload {
+            return Err(PublishError::with_source(
+                PublishErrorKind::MaxPayloadExceeded,
+                format!(
+                    "Payload size limit of {} exceeded by message size of {}",
+                    payload.len(),
+                    max_payload
+                ),
+            ));
+        }
 
         self.sender
             .send(Command::Publish {
@@ -556,6 +591,29 @@ impl Client {
     pub fn connection_state(&self) -> State {
         self.state.borrow().to_owned()
     }
+
+    /// Forces the client to reconnect.
+    /// Keep in mind that client will reconnect automatically if the connection is lost and this
+    /// method does not have to be used in normal circumstances.
+    /// However, if you want to force the client to reconnect, for example to re-trigger
+    /// the `auth-callback`, or manually rebalance connections, this method can be useful.
+    /// This method does not wait for connection to be re-established.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// client.force_reconnect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn force_reconnect(&self) -> Result<(), ReconnectError> {
+        self.sender
+            .send(Command::Reconnect)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// Used for building customized requests.
@@ -653,6 +711,16 @@ impl Request {
     pub fn inbox(mut self, inbox: String) -> Request {
         self.inbox = Some(inbox);
         self
+    }
+}
+
+#[derive(Error, Debug)]
+#[error("failed to send reconnect: {0}")]
+pub struct ReconnectError(#[source] crate::Error);
+
+impl From<tokio::sync::mpsc::error::SendError<Command>> for ReconnectError {
+    fn from(err: tokio::sync::mpsc::error::SendError<Command>) -> Self {
+        ReconnectError(Box::new(err))
     }
 }
 

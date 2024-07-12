@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-//! Manage operations on [Context], create/delete/update [Stream][crate::jetstream::stream::Stream]
+//! Manage operations on [Context], create/delete/update [Stream]
 
 use crate::error::Error;
 use crate::header::{IntoHeaderName, IntoHeaderValue};
@@ -29,7 +29,6 @@ use serde_json::{self, json};
 use std::borrow::Borrow;
 use std::fmt::Display;
 use std::future::IntoFuture;
-use std::io::ErrorKind;
 use std::pin::Pin;
 use std::str::from_utf8;
 use std::task::Poll;
@@ -37,11 +36,17 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::debug;
 
-use super::consumer::{Consumer, FromConsumer, IntoConsumerConfig};
+use super::consumer::{self, Consumer, FromConsumer, IntoConsumerConfig};
 use super::errors::ErrorCode;
+use super::is_valid_name;
 use super::kv::{Store, MAX_HISTORY};
 use super::object_store::{is_valid_bucket_name, ObjectStore};
-use super::stream::{self, Config, DeleteStatus, DiscardPolicy, External, Info, Stream};
+use super::stream::{
+    self, Config, ConsumerError, ConsumerErrorKind, DeleteStatus, DiscardPolicy, External, Info,
+    Stream,
+};
+#[cfg(feature = "server_2_10")]
+use super::stream::{Compression, ConsumerCreateStrictError, ConsumerUpdateError};
 
 /// A context which can perform jetstream scoped requests.
 #[derive(Debug, Clone)]
@@ -225,7 +230,7 @@ impl Context {
     }
 
     /// Create a JetStream [Stream] with given config and return a handle to it.
-    /// That handle can be used to manage and use [Consumer][crate::jetstream::consumer::Consumer].
+    /// That handle can be used to manage and use [Consumer].
     ///
     /// # Examples
     ///
@@ -258,7 +263,7 @@ impl Context {
                 CreateStreamErrorKind::EmptyStreamName,
             ));
         }
-        if config.name.contains([' ', '.']) {
+        if !is_valid_name(config.name.as_str()) {
             return Err(CreateStreamError::new(
                 CreateStreamErrorKind::InvalidStreamName,
             ));
@@ -305,7 +310,7 @@ impl Context {
     }
 
     /// Checks for [Stream] existence on the server and returns handle to it.
-    /// That handle can be used to manage and use [Consumer][crate::jetstream::consumer::Consumer].
+    /// That handle can be used to manage and use [Consumer].
     ///
     /// # Examples
     ///
@@ -323,6 +328,10 @@ impl Context {
         let stream = stream.as_ref();
         if stream.is_empty() {
             return Err(GetStreamError::new(GetStreamErrorKind::EmptyName));
+        }
+
+        if !is_valid_name(stream) {
+            return Err(GetStreamError::new(GetStreamErrorKind::InvalidStreamName));
         }
 
         let subject = format!("STREAM.INFO.{stream}");
@@ -372,6 +381,18 @@ impl Context {
         S: Into<Config>,
     {
         let config: Config = stream_config.into();
+
+        if config.name.is_empty() {
+            return Err(CreateStreamError::new(
+                CreateStreamErrorKind::EmptyStreamName,
+            ));
+        }
+
+        if !is_valid_name(config.name.as_str()) {
+            return Err(CreateStreamError::new(
+                CreateStreamErrorKind::InvalidStreamName,
+            ));
+        }
         let subject = format!("STREAM.INFO.{}", config.name);
 
         let request: Response<Info> = self.request(subject, &()).await?;
@@ -408,6 +429,13 @@ impl Context {
         if stream.is_empty() {
             return Err(DeleteStreamError::new(DeleteStreamErrorKind::EmptyName));
         }
+
+        if !is_valid_name(stream) {
+            return Err(DeleteStreamError::new(
+                DeleteStreamErrorKind::InvalidStreamName,
+            ));
+        }
+
         let subject = format!("STREAM.DELETE.{stream}");
         match self
             .request(subject, &json!({}))
@@ -450,6 +478,19 @@ impl Context {
         S: Borrow<Config>,
     {
         let config = config.borrow();
+
+        if config.name.is_empty() {
+            return Err(CreateStreamError::new(
+                CreateStreamErrorKind::EmptyStreamName,
+            ));
+        }
+
+        if !is_valid_name(config.name.as_str()) {
+            return Err(CreateStreamError::new(
+                CreateStreamErrorKind::InvalidStreamName,
+            ));
+        }
+
         let subject = format!("STREAM.UPDATE.{}", config.name);
         match self.request(subject, config).await? {
             Response::Err { error } => Err(error.into()),
@@ -650,6 +691,7 @@ impl Context {
                 } else {
                     None
                 },
+                placement: config.placement,
                 ..Default::default()
             })
             .await
@@ -759,35 +801,242 @@ impl Context {
         &self,
         consumer: C,
         stream: S,
-    ) -> Result<Consumer<T>, crate::Error>
+    ) -> Result<Consumer<T>, ConsumerError>
     where
         T: FromConsumer + IntoConsumerConfig,
         S: AsRef<str>,
         C: AsRef<str>,
     {
+        if !is_valid_name(stream.as_ref()) {
+            return Err(ConsumerError::with_source(
+                ConsumerErrorKind::InvalidName,
+                "invalid stream",
+            ));
+        }
+
+        if !is_valid_name(consumer.as_ref()) {
+            return Err(ConsumerError::new(ConsumerErrorKind::InvalidName));
+        }
+
         let subject = format!("CONSUMER.INFO.{}.{}", stream.as_ref(), consumer.as_ref());
 
         let info: super::consumer::Info = match self.request(subject, &json!({})).await? {
             Response::Ok(info) => info,
-            Response::Err { error } => {
-                return Err(Box::new(std::io::Error::new(
-                    ErrorKind::Other,
-                    format!("nats: error while getting consumer info: {}", error),
-                )))
-            }
+            Response::Err { error } => return Err(error.into()),
         };
 
         Ok(Consumer::new(
-            T::try_from_consumer_config(info.config.clone())?,
+            T::try_from_consumer_config(info.config.clone()).map_err(|err| {
+                ConsumerError::with_source(ConsumerErrorKind::InvalidConsumerType, err)
+            })?,
             info,
             self.clone(),
         ))
     }
 
+    /// Delete a [crate::jetstream::consumer::Consumer] straight from [Context], without binding to a [Stream] first.
+    ///
+    /// It has one less interaction with the server when binding to only one
+    /// [crate::jetstream::consumer::Consumer].
+    ///
+    /// # Examples:
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::jetstream::consumer::PullConsumer;
+    ///
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// jetstream
+    ///     .delete_consumer_from_stream("consumer", "stream")
+    ///     .await?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_consumer_from_stream<C: AsRef<str>, S: AsRef<str>>(
+        &self,
+        consumer: C,
+        stream: S,
+    ) -> Result<DeleteStatus, ConsumerError> {
+        if !is_valid_name(consumer.as_ref()) {
+            return Err(ConsumerError::new(ConsumerErrorKind::InvalidName));
+        }
+
+        if !is_valid_name(stream.as_ref()) {
+            return Err(ConsumerError::with_source(
+                ConsumerErrorKind::Other,
+                "invalid stream name",
+            ));
+        }
+
+        let subject = format!("CONSUMER.DELETE.{}.{}", stream.as_ref(), consumer.as_ref());
+
+        match self.request(subject, &json!({})).await? {
+            Response::Ok(delete_status) => Ok(delete_status),
+            Response::Err { error } => Err(error.into()),
+        }
+    }
+
+    /// Create or update a `Durable` or `Ephemeral` Consumer (if `durable_name` was not provided) and
+    /// returns the info from the server about created [Consumer] without binding to a [Stream] first.
+    /// If you want a strict update or create, use [Context::create_consumer_strict_on_stream] or [Context::update_consumer_on_stream].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::jetstream::consumer;
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// let consumer: consumer::PullConsumer = jetstream
+    ///     .create_consumer_on_stream(
+    ///         consumer::pull::Config {
+    ///             durable_name: Some("pull".to_string()),
+    ///             ..Default::default()
+    ///         },
+    ///         "stream",
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn create_consumer_on_stream<C: IntoConsumerConfig + FromConsumer, S: AsRef<str>>(
+        &self,
+        config: C,
+        stream: S,
+    ) -> Result<Consumer<C>, ConsumerError> {
+        self.create_consumer_on_stream_action(config, stream, ConsumerAction::CreateOrUpdate)
+            .await
+    }
+
+    /// Update an existing consumer.
+    /// This call will fail if the consumer does not exist.
+    /// returns the info from the server about updated [Consumer] without binding to a [Stream] first.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::jetstream::consumer;
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// let consumer: consumer::PullConsumer = jetstream
+    ///     .update_consumer_on_stream(
+    ///         consumer::pull::Config {
+    ///             durable_name: Some("pull".to_string()),
+    ///             description: Some("updated pull consumer".to_string()),
+    ///             ..Default::default()
+    ///         },
+    ///         "stream",
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "server_2_10")]
+    pub async fn update_consumer_on_stream<C: IntoConsumerConfig + FromConsumer, S: AsRef<str>>(
+        &self,
+        config: C,
+        stream: S,
+    ) -> Result<Consumer<C>, ConsumerUpdateError> {
+        self.create_consumer_on_stream_action(config, stream, ConsumerAction::Update)
+            .await
+            .map_err(|err| err.into())
+    }
+
+    /// Create consumer on stream, but only if it does not exist or the existing config is exactly
+    /// the same.
+    /// This method will fail if consumer is already present with different config.
+    /// returns the info from the server about created [Consumer] without binding to a [Stream] first.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::jetstream::consumer;
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// let consumer: consumer::PullConsumer = jetstream
+    ///     .create_consumer_strict_on_stream(
+    ///         consumer::pull::Config {
+    ///             durable_name: Some("pull".to_string()),
+    ///             ..Default::default()
+    ///         },
+    ///         "stream",
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "server_2_10")]
+    pub async fn create_consumer_strict_on_stream<
+        C: IntoConsumerConfig + FromConsumer,
+        S: AsRef<str>,
+    >(
+        &self,
+        config: C,
+        stream: S,
+    ) -> Result<Consumer<C>, ConsumerCreateStrictError> {
+        self.create_consumer_on_stream_action(config, stream, ConsumerAction::Create)
+            .await
+            .map_err(|err| err.into())
+    }
+
+    async fn create_consumer_on_stream_action<
+        C: IntoConsumerConfig + FromConsumer,
+        S: AsRef<str>,
+    >(
+        &self,
+        config: C,
+        stream: S,
+        action: ConsumerAction,
+    ) -> Result<Consumer<C>, ConsumerError> {
+        let config = config.into_consumer_config();
+
+        let subject = {
+            let filter = if config.filter_subject.is_empty() {
+                "".to_string()
+            } else {
+                format!(".{}", config.filter_subject)
+            };
+            config
+                .name
+                .as_ref()
+                .or(config.durable_name.as_ref())
+                .map(|name| format!("CONSUMER.CREATE.{}.{}{}", stream.as_ref(), name, filter))
+                .unwrap_or_else(|| format!("CONSUMER.CREATE.{}", stream.as_ref()))
+        };
+
+        match self
+            .request(
+                subject,
+                &json!({"stream_name": stream.as_ref(), "config": config, "action": action}),
+            )
+            .await?
+        {
+            Response::Err { error } => Err(ConsumerError::new(ConsumerErrorKind::JetStream(error))),
+            Response::Ok::<consumer::Info>(info) => Ok(Consumer::new(
+                FromConsumer::try_from_consumer_config(info.clone().config)
+                    .map_err(|err| ConsumerError::with_source(ConsumerErrorKind::Other, err))?,
+                info,
+                self.clone(),
+            )),
+        }
+    }
+
     /// Send a request to the jetstream JSON API.
     ///
     /// This is a low level API used mostly internally, that should be used only in
-    /// specific cases when this crate API on [Consumer][crate::jetstream::consumer::Consumer] or [Stream] does not provide needed functionality.
+    /// specific cases when this crate API on [Consumer] or [Stream] does not provide needed functionality.
     ///
     /// # Examples
     ///
@@ -870,11 +1119,19 @@ impl Context {
                 description: config.description.clone(),
                 subjects: vec![chunk_subject, meta_subject],
                 max_age: config.max_age,
+                max_bytes: config.max_bytes,
                 storage: config.storage,
                 num_replicas: config.num_replicas,
                 discard: DiscardPolicy::New,
                 allow_rollup: true,
                 allow_direct: true,
+                #[cfg(feature = "server_2_10")]
+                compression: if config.compression {
+                    Some(Compression::S2)
+                } else {
+                    None
+                },
+                placement: config.placement,
                 ..Default::default()
             })
             .await
@@ -1034,17 +1291,17 @@ struct StreamInfoPage {
     streams: Option<Vec<super::stream::Info>>,
 }
 
-type PageRequest<'a> = BoxFuture<'a, Result<StreamPage, RequestError>>;
+type PageRequest = BoxFuture<'static, Result<StreamPage, RequestError>>;
 
-pub struct StreamNames<'a> {
+pub struct StreamNames {
     context: Context,
     offset: usize,
-    page_request: Option<PageRequest<'a>>,
+    page_request: Option<PageRequest>,
     streams: Vec<String>,
     done: bool,
 }
 
-impl futures::Stream for StreamNames<'_> {
+impl futures::Stream for StreamNames {
     type Item = Result<String, StreamsError>;
 
     fn poll_next(
@@ -1105,20 +1362,20 @@ impl futures::Stream for StreamNames<'_> {
     }
 }
 
-type PageInfoRequest<'a> = BoxFuture<'a, Result<StreamInfoPage, RequestError>>;
+type PageInfoRequest = BoxFuture<'static, Result<StreamInfoPage, RequestError>>;
 
 pub type StreamsErrorKind = RequestErrorKind;
 pub type StreamsError = RequestError;
 
-pub struct Streams<'a> {
+pub struct Streams {
     context: Context,
     offset: usize,
-    page_request: Option<PageInfoRequest<'a>>,
+    page_request: Option<PageInfoRequest>,
     streams: Vec<super::stream::Info>,
     done: bool,
 }
 
-impl futures::Stream for Streams<'_> {
+impl futures::Stream for Streams {
     type Item = Result<super::stream::Info, StreamsError>;
 
     fn poll_next(
@@ -1339,6 +1596,7 @@ impl From<RequestError> for CreateStreamError {
 pub enum GetStreamErrorKind {
     EmptyName,
     Request,
+    InvalidStreamName,
     JetStream(super::errors::Error),
 }
 
@@ -1347,6 +1605,7 @@ impl Display for GetStreamErrorKind {
         match self {
             Self::EmptyName => write!(f, "empty name cannot be empty"),
             Self::Request => write!(f, "request error"),
+            Self::InvalidStreamName => write!(f, "invalid stream name"),
             Self::JetStream(err) => write!(f, "jetstream error: {}", err),
         }
     }
@@ -1455,4 +1714,16 @@ impl From<RequestError> for AccountError {
             RequestErrorKind::Other => AccountError::with_source(AccountErrorKind::Other, err),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+enum ConsumerAction {
+    #[serde(rename = "")]
+    CreateOrUpdate,
+    #[serde(rename = "create")]
+    #[cfg(feature = "server_2_10")]
+    Create,
+    #[serde(rename = "update")]
+    #[cfg(feature = "server_2_10")]
+    Update,
 }

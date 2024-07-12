@@ -146,3 +146,11 @@ ObjectMetadata
 S2
 inactive_threshold
 max_ack_pending
+footgun
+KV
+rebalance
+update_consumer
+update_consumer_on_stream
+create_consumer_strict
+create_consumer_strict_on_stream
+leafnodes

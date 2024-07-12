@@ -17,7 +17,7 @@ mod kv {
     use async_nats::{
         jetstream::{
             kv::Operation,
-            stream::{DiscardPolicy, Republish, Source, StorageType},
+            stream::{self, DiscardPolicy, Republish, Source, StorageType},
         },
         ConnectOptions,
     };
@@ -25,7 +25,7 @@ mod kv {
     use futures::{StreamExt, TryStreamExt};
 
     #[tokio::test]
-    async fn create() {
+    async fn create_bucket() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = ConnectOptions::new()
             .event_callback(|event| async move { println!("event: {event:?}") })
@@ -50,6 +50,45 @@ mod kv {
         assert_eq!("KV_test", kv.stream_name);
         assert_eq!(info.config.discard, DiscardPolicy::New);
         assert!(info.config.allow_direct);
+    }
+
+    #[tokio::test]
+    async fn create() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .event_callback(|event| async move { println!("event: {event:?}") })
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "test".into(),
+                description: "test_description".into(),
+                history: 10,
+                storage: StorageType::File,
+                num_replicas: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let payload: Bytes = "data".into();
+        let create = kv.create("key", payload.clone()).await;
+        assert!(create.is_ok());
+
+        let create = kv.create("key", payload.clone()).await;
+        assert!(create.is_err());
+
+        kv.delete("key").await.unwrap();
+        let create = kv.create("key", payload.clone()).await;
+        assert!(create.is_ok());
+
+        kv.purge("key").await.unwrap();
+        let create = kv.create("key", payload.clone()).await;
+        assert!(create.is_ok());
     }
 
     #[tokio::test]
@@ -212,7 +251,6 @@ mod kv {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = ConnectOptions::new()
             .event_callback(|event| async move { println!("event: {event:?}") })
-            // .connect(server.client_url())
             .connect(server.client_url())
             .await
             .unwrap();
@@ -248,11 +286,59 @@ mod kv {
     }
 
     #[tokio::test]
+    async fn delete_expect_revision() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .event_callback(|event| async move { println!("event: {event:?}") })
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "delete".into(),
+                description: "test_description".into(),
+                history: 10,
+                storage: StorageType::File,
+                num_replicas: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let payload: Bytes = "data".into();
+        let revision = kv.put("key", payload.clone()).await.unwrap();
+        let value = kv.get("key").await.unwrap();
+        assert_eq!(from_utf8(&value.unwrap()).unwrap(), payload);
+
+        let wrong_revision = 3;
+        let failed = kv
+            .delete_expect_revision("key", Some(wrong_revision))
+            .await
+            .is_err();
+        assert!(failed);
+
+        kv.delete_expect_revision("key", Some(revision))
+            .await
+            .unwrap();
+        let ss = kv.get("kv").await.unwrap();
+        assert!(ss.is_none());
+
+        let mut entries = kv.history("key").await.unwrap();
+
+        let first_op = entries.next().await;
+        assert_eq!(first_op.unwrap().unwrap().operation, Operation::Put);
+
+        let first_op = entries.next().await;
+        assert_eq!(first_op.unwrap().unwrap().operation, Operation::Delete);
+    }
+
+    #[tokio::test]
     async fn purge() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = ConnectOptions::new()
             .event_callback(|event| async move { println!("event: {event:?}") })
-            // .connect(server.client_url())
             .connect(server.client_url())
             .await
             .unwrap();
@@ -284,6 +370,56 @@ mod kv {
         let history = kv.history("dz").await.unwrap().count().await;
         assert_eq!(history, 6);
         kv.purge("dz").await.unwrap();
+        let history = kv.history("dz").await.unwrap().count().await;
+        assert_eq!(history, 1);
+    }
+
+    #[tokio::test]
+    async fn purge_expect_revision() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .event_callback(|event| async move { println!("event: {event:?}") })
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "purge".into(),
+                description: "test_description".into(),
+                history: 10,
+                storage: StorageType::File,
+                num_replicas: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        kv.put("dz", "0".into()).await.unwrap();
+        kv.put("dz", "1".into()).await.unwrap();
+        kv.put("dz", "2".into()).await.unwrap();
+        kv.put("dz", "3".into()).await.unwrap();
+        kv.put("dz", "4".into()).await.unwrap();
+        let revision = kv.put("dz", "5".into()).await.unwrap();
+
+        kv.put("baz", "0".into()).await.unwrap();
+        kv.put("baz", "1".into()).await.unwrap();
+        kv.put("baz", "2".into()).await.unwrap();
+
+        let history = kv.history("dz").await.unwrap().count().await;
+        assert_eq!(history, 6);
+
+        let wrong_revision = 3;
+        let failed = kv
+            .purge_expect_revision("dz", Some(wrong_revision))
+            .await
+            .is_err();
+        assert!(failed);
+
+        kv.purge_expect_revision("dz", Some(revision))
+            .await
+            .unwrap();
         let history = kv.history("dz").await.unwrap().count().await;
         assert_eq!(history, 1);
     }
@@ -573,6 +709,52 @@ mod kv {
             }
         }
     }
+
+    #[tokio::test]
+    async fn watch_from_revision() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "bucket".into(),
+                description: "test_description".into(),
+                history: 15,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        kv.put("foo", "bar".into()).await.unwrap();
+        kv.put("foo", "baz".into()).await.unwrap();
+        kv.put("bar", "foo".into()).await.unwrap();
+        kv.put("bar", "bar".into()).await.unwrap();
+        kv.put("baz", "foo".into()).await.unwrap();
+
+        let mut watch = kv.watch_from_revision("foo", 2).await.unwrap().take(1);
+        let key = watch.next().await.unwrap().unwrap();
+        assert_eq!(key.key, "foo");
+        assert_eq!(key.value, "baz".as_bytes());
+        assert_eq!(key.revision, 2);
+
+        let mut watch = kv.watch_all_from_revision(3).await.unwrap().take(3);
+        let key = watch.next().await.unwrap().unwrap();
+        assert_eq!(key.key, "bar");
+        assert_eq!(key.value, "foo".as_bytes());
+        assert_eq!(key.revision, 3);
+        let key = watch.next().await.unwrap().unwrap();
+        assert_eq!(key.key, "bar");
+        assert_eq!(key.value, "bar".as_bytes());
+        let key = watch.next().await.unwrap().unwrap();
+        assert_eq!(key.key, "baz");
+        assert_eq!(key.value, "foo".as_bytes());
+    }
+
     #[tokio::test]
     async fn keys() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
@@ -652,17 +834,22 @@ mod kv {
             .unwrap();
 
         kv.put("baz", "value".into()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            kv.keys()
-                .await
-                .unwrap()
-                .try_collect::<Vec<String>>()
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
+        tryhard::retry_fn(|| async {
+            match kv.keys().await {
+                Ok(keys) => {
+                    let keys = keys.try_collect::<Vec<String>>().await.unwrap();
+                    if !keys.is_empty() {
+                        return Err("keys not empty".into());
+                    }
+                    Ok::<(), async_nats::Error>(())
+                }
+                Err(e) => Err(e.into()),
+            }
+        })
+        .retries(5)
+        .exponential_backoff(Duration::from_millis(100))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -745,9 +932,19 @@ mod kv {
         let local_kv = leaf_js.get_key_value("MIRROR").await.unwrap();
 
         local_kv.put("name", "rip".into()).await.unwrap();
-
-        let name = local_kv.get("name").await.unwrap();
-        assert_eq!(from_utf8(&name.unwrap()).unwrap(), "rip");
+        tryhard::retry_fn(|| async {
+            match local_kv.get("name").await {
+                Ok(Some(name)) => {
+                    assert_eq!(from_utf8(&name).unwrap(), "rip");
+                    Ok::<(), async_nats::Error>(())
+                }
+                _ => Err("key not found".into()),
+            }
+        })
+        .retries(5)
+        .exponential_backoff(Duration::from_millis(500))
+        .await
+        .unwrap();
 
         // Bind through leafnode connection but to origin KV.
         let leaf_hub_js = async_nats::jetstream::with_domain(leaf, "HUB");
@@ -766,5 +963,86 @@ mod kv {
         drop(hub_server);
 
         local_kv.get("name").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn republish_headers_handling() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+
+        let client = ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client.clone());
+
+        context
+            .create_stream(async_nats::jetstream::stream::Config {
+                subjects: vec!["A.>".into(), "B.>".into()],
+                name: "source".into(),
+                republish: Some(async_nats::jetstream::stream::Republish {
+                    source: "A.>".into(),
+                    destination: "$KV.test.>".into(),
+                    headers_only: false,
+                }),
+                max_messages_per_subject: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let kv_stream = context
+            .create_stream(stream::Config {
+                subjects: vec!["$KV.test.>".into()],
+                name: "KV_test".into(),
+                max_messages_per_subject: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let kv = context.get_key_value("test").await.unwrap();
+
+        // Publish some messages to alter the sequences for republished messages.
+        context
+            .publish("B.foo", "data".into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        context
+            .publish("B.bar", "data".into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        // now, publish the actual KV keys.
+        context
+            .publish("A.orange", "key".into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        context
+            .publish("A.tomato", "hello".into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert_eq!(1, kv.entry("orange").await.unwrap().unwrap().revision);
+        assert_eq!(2, kv.entry("tomato").await.unwrap().unwrap().revision);
+
+        let mut config = kv_stream.cached_info().config.clone();
+        config.allow_direct = true;
+
+        // Update the stream to allow direct access.
+        context.update_stream(config).await.unwrap();
+        // Get a fresh instance, so owe are using direct get.
+        let kv = context.get_key_value("test").await.unwrap();
+
+        assert_eq!(1, kv.entry("orange").await.unwrap().unwrap().revision);
+        assert_eq!(2, kv.entry("tomato").await.unwrap().unwrap().revision);
     }
 }

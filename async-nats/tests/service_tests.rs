@@ -539,8 +539,8 @@ mod service {
 
             match JSONSchema::compile(&schema).unwrap().validate(&data) {
                 Ok(_) => (),
-                Err(errs) => {
-                    for err in errs {
+                Err(mut errs) => {
+                    if let Some(err) = errs.next() {
                         panic!("schema {} validation error: {}", endpoint, err)
                     }
                 }
@@ -550,6 +550,24 @@ mod service {
         fn schema_url(url: &str) -> String {
             format!("https://raw.githubusercontent.com/nats-io/jsm.go/main/schemas/micro/v1/{}_response.json",  url)
         }
+    }
+
+    #[tokio::test]
+    async fn stop() {
+        let server = nats_server::run_basic_server();
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let service = client
+            .service_builder()
+            .start("service", "1.0.0")
+            .await
+            .unwrap();
+
+        let mut endpoint = service.endpoint("products").await.unwrap();
+
+        service.stop().await.unwrap();
+        client.publish("products", "data".into()).await.unwrap();
+        assert!(endpoint.next().await.is_none());
     }
 
     #[tokio::test]

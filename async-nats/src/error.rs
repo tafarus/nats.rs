@@ -60,7 +60,16 @@ where
     }
 }
 
-impl<Kind> std::error::Error for Error<Kind> where Kind: Clone + Debug + Display + PartialEq {}
+impl<Kind> std::error::Error for Error<Kind>
+where
+    Kind: Clone + Debug + Display + PartialEq,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|boxed| boxed.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl<Kind> From<Kind> for Error<Kind>
 where
@@ -69,28 +78,6 @@ where
     fn from(kind: Kind) -> Self {
         Self { kind, source: None }
     }
-}
-
-/// Enables wrapping source errors to the crate-specific error type
-/// by additionally specifying the kind of the target error.
-trait WithKind<Kind>
-where
-    Kind: Clone + Debug + Display + PartialEq,
-    Self: Into<crate::Error>,
-{
-    fn with_kind(self, kind: Kind) -> Error<Kind> {
-        Error::<Kind> {
-            kind,
-            source: Some(self.into()),
-        }
-    }
-}
-
-impl<E, Kind> WithKind<Kind> for E
-where
-    Kind: Clone + Debug + Display + PartialEq,
-    E: Into<crate::Error>,
-{
 }
 
 #[cfg(test)]
@@ -144,13 +131,6 @@ mod test {
     }
 
     #[test]
-    fn display_with_source() {
-        let source = std::io::Error::new(std::io::ErrorKind::Other, "foo");
-        let error = source.with_kind(FooErrorKind::Bar);
-        assert_eq!(format!("{}", error), "bar error: foo");
-    }
-
-    #[test]
     fn display_without_source() {
         let error: FooError = FooErrorKind::Bar.into();
         assert_eq!(format!("{}", error), "bar error");
@@ -161,13 +141,5 @@ mod test {
         let error: FooError = FooErrorKind::Bar.into();
         assert_eq!(error.kind, FooErrorKind::Bar);
         assert!(error.source.is_none());
-    }
-
-    #[test]
-    fn with_kind() {
-        let source = std::io::Error::new(std::io::ErrorKind::Other, "foo");
-        let error: FooError = source.with_kind(FooErrorKind::Baz);
-        assert_eq!(error.kind(), FooErrorKind::Baz);
-        assert_eq!(format!("{}", error), "baz error: foo");
     }
 }

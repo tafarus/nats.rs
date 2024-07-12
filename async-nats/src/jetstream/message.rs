@@ -18,7 +18,7 @@ use crate::Error;
 use bytes::Bytes;
 use futures::future::TryFutureExt;
 use futures::StreamExt;
-use std::time::Duration;
+use std::{mem, time::Duration};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug)]
@@ -45,8 +45,8 @@ impl Message {
     /// Splits [Message] into [Acker] and [crate::Message].
     /// This can help reduce memory footprint if [Message] can be dropped before acking,
     /// for example when it's transformed into another structure and acked later
-    pub fn split(self) -> (crate::Message, Acker) {
-        let reply = self.message.reply.clone();
+    pub fn split(mut self) -> (crate::Message, Acker) {
+        let reply = mem::take(&mut self.message.reply);
         (
             self.message,
             Acker {
@@ -336,6 +336,9 @@ pub struct Acker {
 // The async-trait crate is not a solution here, as it would mean we're allocating at every ack.
 // Creating separate function to ack just to avoid one duplication is not worth it either.
 impl Acker {
+    pub fn new(context: Context, reply: Option<Subject>) -> Self {
+        Self { context, reply }
+    }
     /// Acknowledges a message delivery by sending `+ACK` to the server.
     ///
     /// If [AckPolicy][crate::jetstream::consumer::AckPolicy] is set to `All` or `Explicit`, messages has to be acked.
@@ -553,7 +556,7 @@ pub struct Info<'a> {
     pub stream_sequence: u64,
     /// The consumer sequence number associated with this message
     pub consumer_sequence: u64,
-    /// the number of messages known by the server to be delivered to this consumer
+    /// The number of delivery attempts for this message
     pub delivered: i64,
     /// the number of messages known by the server to be pending to this consumer
     pub pending: u64,

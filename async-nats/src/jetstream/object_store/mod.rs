@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use std::fmt::Display;
 use std::{cmp, str::FromStr, task::Poll, time::Duration};
 
+use crate::crypto::Sha256;
 use crate::subject::Subject;
 use crate::{HeaderMap, HeaderValue};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE};
@@ -23,7 +24,6 @@ use base64::engine::Engine;
 use bytes::BytesMut;
 use futures::future::BoxFuture;
 use once_cell::sync::Lazy;
-use ring::digest::SHA256;
 use tokio::io::AsyncReadExt;
 
 use futures::{Stream, StreamExt};
@@ -72,10 +72,16 @@ pub struct Config {
     /// Maximum age of any value in the bucket, expressed in nanoseconds
     #[serde(default, with = "serde_nanos")]
     pub max_age: Duration,
+    /// How large the storage bucket may become in total bytes.
+    pub max_bytes: i64,
     /// The type of storage backend, `File` (default) and `Memory`
     pub storage: StorageType,
     /// How many replicas to keep for each value in a cluster, maximum 5.
     pub num_replicas: usize,
+    /// Sets compression of the underlying stream.
+    pub compression: bool,
+    // Cluster and tag placement.
+    pub placement: Option<stream::Placement>,
 }
 
 /// A blob store capable of storing large objects efficiently in streams.
@@ -109,10 +115,14 @@ impl ObjectStore {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get<'bucket, 'object, 'future, T>(
+    pub async fn get<T: AsRef<str> + Send>(&self, object_name: T) -> Result<Object, GetError> {
+        self.get_impl(object_name).await
+    }
+
+    fn get_impl<'bucket, 'future, T>(
         &'bucket self,
         object_name: T,
-    ) -> BoxFuture<'future, Result<Object<'object>, GetError>>
+    ) -> BoxFuture<'future, Result<Object, GetError>>
     where
         T: AsRef<str> + Send + 'future,
         'bucket: 'future,
@@ -125,7 +135,7 @@ impl ObjectStore {
                         let link_name = link_name.clone();
                         debug!("getting object via link");
                         if link.bucket == self.name {
-                            return self.get(link_name).await;
+                            return self.get_impl(link_name).await;
                         } else {
                             let bucket = self
                                 .stream
@@ -135,7 +145,7 @@ impl ObjectStore {
                                 .map_err(|err| {
                                 GetError::with_source(GetErrorKind::Other, err)
                             })?;
-                            let object = bucket.get(&link_name).await?;
+                            let object = bucket.get_impl(&link_name).await?;
                             return Ok(object);
                         }
                     } else {
@@ -149,10 +159,7 @@ impl ObjectStore {
         })
     }
 
-    /// Gets an [Object] from the [ObjectStore].
-    ///
-    /// [Object] implements [tokio::io::AsyncRead] that allows
-    /// to read the data from Object Store.
+    /// Deletes an [Object] from the [ObjectStore].
     ///
     /// # Examples
     ///
@@ -301,7 +308,7 @@ impl ObjectStore {
 
         let chunk_size = object_meta.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
         let mut buffer = BytesMut::with_capacity(chunk_size);
-        let mut context = ring::digest::Context::new(&SHA256);
+        let mut sha256 = Sha256::new();
 
         loop {
             let n = data
@@ -314,7 +321,7 @@ impl ObjectStore {
             }
 
             let payload = buffer.split().freeze();
-            context.update(&payload);
+            sha256.update(&payload);
 
             object_size += payload.len();
             object_chunks += 1;
@@ -337,7 +344,7 @@ impl ObjectStore {
                     )
                 })?;
         }
-        let digest = context.finish();
+        let digest = sha256.finish();
         let subject = format!("$O.{}.M.{}", &self.name, &encoded_object_name);
         let object_info = ObjectInfo {
             name: object_meta.name,
@@ -424,13 +431,13 @@ impl ObjectStore {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn watch(&self) -> Result<Watch<'_>, WatchError> {
+    pub async fn watch(&self) -> Result<Watch, WatchError> {
         self.watch_with_deliver_policy(DeliverPolicy::New).await
     }
 
     /// Creates a [Watch] stream over changes in the [ObjectStore] which yields values whenever
     /// there are changes for that key with as well as last value.
-    pub async fn watch_with_history(&self) -> Result<Watch<'_>, WatchError> {
+    pub async fn watch_with_history(&self) -> Result<Watch, WatchError> {
         self.watch_with_deliver_policy(DeliverPolicy::LastPerSubject)
             .await
     }
@@ -438,7 +445,7 @@ impl ObjectStore {
     async fn watch_with_deliver_policy(
         &self,
         deliver_policy: DeliverPolicy,
-    ) -> Result<Watch<'_>, WatchError> {
+    ) -> Result<Watch, WatchError> {
         let subject = format!("$O.{}.M.>", self.name);
         let ordered = self
             .stream
@@ -474,7 +481,7 @@ impl ObjectStore {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn list(&self) -> Result<List<'_>, ListError> {
+    pub async fn list(&self) -> Result<List, ListError> {
         trace!("starting Object List");
         let subject = format!("$O.{}.M.>", self.name);
         let ordered = self
@@ -828,11 +835,11 @@ async fn publish_meta(store: &ObjectStore, info: &ObjectInfo) -> Result<(), Publ
     Ok(())
 }
 
-pub struct Watch<'a> {
-    subscription: crate::jetstream::consumer::push::Ordered<'a>,
+pub struct Watch {
+    subscription: crate::jetstream::consumer::push::Ordered,
 }
 
-impl Stream for Watch<'_> {
+impl Stream for Watch {
     type Item = Result<ObjectInfo, WatcherError>;
 
     fn poll_next(
@@ -858,12 +865,12 @@ impl Stream for Watch<'_> {
     }
 }
 
-pub struct List<'a> {
-    subscription: Option<crate::jetstream::consumer::push::Ordered<'a>>,
+pub struct List {
+    subscription: Option<crate::jetstream::consumer::push::Ordered>,
     done: bool,
 }
 
-impl Stream for List<'_> {
+impl Stream for List {
     type Item = Result<ObjectInfo, ListerError>;
 
     fn poll_next(
@@ -913,24 +920,24 @@ impl Stream for List<'_> {
 }
 
 /// Represents an object stored in a bucket.
-pub struct Object<'a> {
+pub struct Object {
     pub info: ObjectInfo,
     remaining_bytes: VecDeque<u8>,
     has_pending_messages: bool,
-    digest: Option<ring::digest::Context>,
-    subscription: Option<crate::jetstream::consumer::push::Ordered<'a>>,
-    subscription_future: Option<BoxFuture<'a, Result<Ordered<'a>, StreamError>>>,
+    digest: Option<Sha256>,
+    subscription: Option<crate::jetstream::consumer::push::Ordered>,
+    subscription_future: Option<BoxFuture<'static, Result<Ordered, StreamError>>>,
     stream: crate::jetstream::stream::Stream,
 }
 
-impl<'a> Object<'a> {
+impl Object {
     pub(crate) fn new(info: ObjectInfo, stream: stream::Stream) -> Self {
         Object {
             subscription: None,
             info,
             remaining_bytes: VecDeque::new(),
             has_pending_messages: true,
-            digest: Some(ring::digest::Context::new(&SHA256)),
+            digest: Some(Sha256::new()),
             subscription_future: None,
             stream,
         }
@@ -942,7 +949,7 @@ impl<'a> Object<'a> {
     }
 }
 
-impl tokio::io::AsyncRead for Object<'_> {
+impl tokio::io::AsyncRead for Object {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1009,7 +1016,7 @@ impl tokio::io::AsyncRead for Object<'_> {
                                 )
                             })?;
                             if info.pending == 0 {
-                                let digest = self.digest.take().map(|context| context.finish());
+                                let digest = self.digest.take().map(Sha256::finish);
                                 if let Some(digest) = digest {
                                     if self
                                         .info
@@ -1137,7 +1144,7 @@ pub trait AsObjectInfo {
     fn as_info(&self) -> &ObjectInfo;
 }
 
-impl AsObjectInfo for &Object<'_> {
+impl AsObjectInfo for &Object {
     fn as_info(&self) -> &ObjectInfo {
         &self.info
     }
